@@ -52,6 +52,8 @@ include/gcc/
 include/compiler/gcc/stdlib.h
 pc/lib/SDL*
 portmaster/*.zip
+a30/*.zip
+a30/Roms/
 
 # local harness artifacts (never commit the disc image)
 harness/rom/

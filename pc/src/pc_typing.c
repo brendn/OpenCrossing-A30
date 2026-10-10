@@ -97,6 +97,16 @@ int pc_utf8_to_game_code(const char* text) {
 }
 
 void pc_typing_handle_event(const SDL_Event* event) {
+    /* PC_NO_TYPING=1: devices without a real keyboard (Miyoo A30: its
+     * buttons ARE keyboard keys, and L1 sends Tab — typing mode would turn
+     * A/L2/R2 into ' '/'e'/'t' in the in-game keyboard) */
+    static int s_no_typing = -1;
+    if (s_no_typing < 0) {
+        const char* e = getenv("PC_NO_TYPING");
+        s_no_typing = (e && atoi(e) != 0);
+    }
+    if (s_no_typing) return;
+
     if (event->type == SDL_KEYDOWN) {
         if (event->key.keysym.sym == SDLK_TAB && !event->key.repeat && g_pc_editor_active) {
             g_pc_typing_mode ^= 1;

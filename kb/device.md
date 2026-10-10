@@ -33,6 +33,86 @@
   PortMaster games there) — Menu/Function opens settings, Select+Start
   exits. Noted in README. Listed in README supported-devices table.
 
+## Miyoo A30 (spruceOS) — experimental port, started 2026-10-07
+
+**Device-verified (user report, 2026-10-08): runs at a mostly rock-solid
+60 fps.** Also passes the Mesa GLES2 smoke matrix (kb/build-test.md). Some
+notes below are still pre-device research; trust device logs over them.
+
+- Hardware: Allwinner A33, 4x Cortex-A7 @ 1.2 GHz, **Mali-400 MP2 (GLES
+  2.0 only, fp16-only fragment shaders)**, 512 MB RAM, 2.8" panel that is
+  **480x640 portrait-scanned** (apps rotate their own output; there is no
+  kernel rotation — mupen64plus uses `M64P_ROTATE=1`, GVU rotates by hand).
+- OS: spruceOS, **glibc 2.23**, no PortMaster ("PortMaster app and games
+  are not supported on the A30"). Ports are plain `.sh` files in
+  `/mnt/SDCARD/Roms/A30PORTS/`, run with `/bin/sh` from that dir.
+- Device SDL2 2.26.1 lives in `/usr/miyoo/lib`. The A30's working
+  PPSSPP binary NEEDs `libGLESv2.so` + `libEGL.so` (unversioned) and
+  nothing above GLIBC_2.17 — hence the stub-SONAME link in
+  `pc/build-a30-docker.sh` and SDL_VIDEO_GL/EGL_DRIVER in the launcher.
+- Input: buttons are keyboard keys. **Authoritative layout = spruce's
+  `spruce/scripts/platform/A30.cfg`** (Linux key codes): A=Space(57)
+  B=LCtrl(29) X=LShift(42) Y=LAlt(56) **L1=Tab(15) L2=E(18)
+  R1=Backspace(14) R2=T(20)** Start=Return(28) Select=RCtrl(97)
+  Menu=Escape(1), d-pad=arrows. NOT the Miyoo Mini layout — the first
+  launcher assumed L1=E/R1=T/L2=Tab/R2=Backspace, so L1 (Tab) opened the
+  settings menu and all four shoulders were mis-bound (2026-10-08 report).
+  No stick click exists (spruce's B_L3/B_R3 are virtual keycodes).
+- **Binding audit fixes (2026-10-08, device-confirmed 2026-10-10)**:
+  new `Menu` keybinding (keybindings.ini, default Tab = old behaviour,
+  rebindable in the Controls tab) replaces the hard-coded Tab menu toggle
+  (pc_main.c; skipped while the Controls tab is capturing a key). A30
+  launcher: L=Tab(L1) R=Backspace(R1) Z=T(R2) Menu=E(L2); an existing
+  keybindings.ini without a `Menu` line is moved to keybindings.ini.old
+  and regenerated once. `PC_NO_TYPING=1` (pc_typing.c) — on the A30, L1
+  (Tab) in the in-game keyboard used to enter PC typing mode, turning
+  A/L2/R2 into ' '/'e'/'t'. Escape (A30 Menu button) quits only on a
+  second press within 2s when no SDL message box can be shown, with an
+  overlay toast (SDL_QUIT/window close still quits immediately — that's
+  how launchers stop us). Settings-menu tabs also switch with the keys
+  bound to GC L/R; the menu key never switches tabs; holding the key
+  bound to GC Z also clears a binding (A30 has no Delete / pad X). The stick is spruce's
+  `joystickinput` daemon: `killall -USR2 joystickinput` = stick→d-pad,
+  `-USR1` = analog. Launcher uses d-pad mode (game sees no SDL
+  controller) and writes an A30 keybindings.ini on first run. Menu
+  (Escape) quits the game without a save prompt.
+- Launcher: `a30/Animal Crossing.sh` (not a PortMaster launcher; the
+  check-launcher-sync rule doesn't cover it). Sets `PC_GLES2=1`, first-run
+  settings: render_scale 75, fps dynamic, show_fps 1, verbose 1, LowSpec
+  frustum_cull 1 / shadow_quality 1 / particle_quality 2.
+- Rotation is auto (fullscreen + portrait drawable → 90° CCW, matching
+  GVU). If the first device run is sideways/upside down: `PC_ROTATE=270`.
+  If SDL reports 640x480 on the A30 the auto-detect won't fire — check
+  the `[PC] Display rotation` / `Window created` lines in log.txt.
+- **First device run (2026-10-07)**: SDL video driver `mali`, panel
+  reported 480x640 → rotation 90 (FPS overlay correctly top-right), GLES
+  2.0 context "Mali-400 MP / mali450-r5p1-01rel0", GLSL ES 1.00. Exts
+  include OES_vertex_array_object, OES_texture_npot, OES_depth24,
+  OES_packed_depth_stencil, OES_get_program_binary, OES_mapbuffer — no
+  base_vertex. All 101 seed shaders compiled; FBO 480x360 complete;
+  **60 FPS / 100% speed** on the title + intro. Sound + input worked.
+  Screen was BLACK (overlay only): glUniformMatrix*fv(transpose=GL_TRUE)
+  is GL_INVALID_VALUE on GLES2, so no matrix ever reached the shader —
+  fixed by CPU-transposing (pc_gx.c upload_mat4/3_rowmajor). The same
+  error had tripped the streaming-VBO probe; GLES2 now defaults to the
+  legacy orphan-per-flush VBO path (PC_STREAM_VBO=1 opts in).
+  /usr/lib/libGLESv2.so and libEGL.so → libMali.so (both versioned and
+  unversioned names exist). SDL also exposes an "Atari Xbox 360 Game
+  Controller" (spruce's joystickinput) with an analog stick — candidate
+  for real analog walking instead of the d-pad-mode stick.
+- **Double input (2026-10-07, after the black-screen fix: "it works!")**:
+  that virtual pad ALSO reports the buttons, with a different layout, so
+  each press hit two GC buttons — visible in the in-game keyboard (d-pad
+  right also inserted a space = GC DRIGHT past end of text; A acted like
+  B). Launcher now sets `PC_NO_CONTROLLER=1` (pc_pad.c: never open SDL
+  game controllers → keyboard path only). If analog walking is wanted
+  later, flip it: controller only + a keyboard-ignore switch, and verify
+  the virtual pad's button layout from a log first.
+- First things to read in an A30 log: which GLES attempt succeeded, the
+  `[PC] GLES 2.0 path: vao=... program_binary=... npot=...` line, the GL
+  extension list, `[GX] Render FBO: ... (INCOMPLETE!)`, and any
+  `[PC/TEV] Specialized shader failed to compile` dumps.
+
 ## Hardware: Anbernic RG-34XX SP
 
 - SoC: Allwinner H700, 4x Cortex-A53 (~1.5 GHz), armv7 userland (armhf)

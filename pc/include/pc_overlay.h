@@ -15,6 +15,10 @@ void pc_overlay_boot_error_frame(const char* const* lines, int n_lines);
 
 /* Settings menu (Select / Tab) */
 void pc_overlay_menu_toggle(void);
+/* 1 while the Controls tab waits for a key to bind (menu key must not toggle) */
+int  pc_overlay_capturing(void);
+/* Short centered message drawn over the game for `ms` milliseconds */
+void pc_overlay_toast(const char* msg, Uint32 ms);
 
 #ifdef __cplusplus
 }

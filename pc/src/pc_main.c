@@ -8,6 +8,7 @@
 #include "pc_disc.h"
 #include "pc_overlay.h"
 #include "pc_typing.h"
+#include "pc_gl_compat.h"
 
 /* prefer discrete GPU on laptops */
 #ifdef _WIN32
@@ -124,54 +125,10 @@ unsigned int pc_crash_get_addr(void) {
     return pc_last_crash_addr;
 }
 
-void pc_platform_init(void) {
-#ifdef _WIN32
-    SetProcessDPIAware();
-#endif
-
-    /* Log environment before init to help debug display issues */
-    fprintf(stderr, "[PC] Platform init begin\n");
-    {
-        const char* vd = SDL_getenv("SDL_VIDEODRIVER");
-        const char* da = SDL_getenv("DISPLAY");
-        const char* wa = SDL_getenv("WAYLAND_DISPLAY");
-        fprintf(stderr, "[PC] SDL_VIDEODRIVER=%s  DISPLAY=%s  WAYLAND_DISPLAY=%s\n",
-                vd ? vd : "(not set)",
-                da ? da : "(not set)",
-                wa ? wa : "(not set)");
-    }
-
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
-        fprintf(stderr, "[PC] SDL_Init failed: %s\n", SDL_GetError());
-        exit(1);
-    }
-    fprintf(stderr, "[PC] SDL video driver: %s\n", SDL_GetCurrentVideoDriver());
-
-    /* No resolution in settings.ini: match the panel's native mode (RG35XX
-     * 640x480, RG-34XX SP 720x480, CubeXX 720x720). Explicit ini values win. */
-    pc_settings_autodetect_resolution();
-
-#ifdef PC_USE_GLES
-    fprintf(stderr, "[PC] GL profile: GLES 3.1\n");
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-#else
-    fprintf(stderr, "[PC] GL profile: Core 3.3\n");
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-#endif
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-#ifdef PC_ENHANCEMENTS
-    if (g_pc_settings.msaa > 0) {
-        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
-        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, g_pc_settings.msaa);
-        fprintf(stderr, "[PC] MSAA: %dx\n", g_pc_settings.msaa);
-    }
-#endif
-
+/* Window creation with the current SDL_GL attributes; NULL if every
+ * fallback failed. */
+static SDL_Window* pc_create_window(void) {
+    SDL_Window* win = NULL;
     /* Window creation with fallback chain.
      *
      * KMS/DRM devices (handhelds running muOS, ArkOS, JELOS, etc.) use the
@@ -208,23 +165,23 @@ void pc_platform_init(void) {
             }
             fprintf(stderr, "[PC] SDL_CreateWindow attempt 1: %dx%d flags=0x%x kmsdrm=%d\n",
                     win_w, win_h, flags, is_kmsdrm);
-            g_pc_window = SDL_CreateWindow(PC_WINDOW_TITLE,
+            win = SDL_CreateWindow(PC_WINDOW_TITLE,
                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 win_w, win_h, flags);
         }
 
         /* Attempt 2: FULLSCREEN_DESKTOP if mode-change failed */
-        if (!g_pc_window && g_pc_settings.fullscreen == 1) {
+        if (!win && g_pc_settings.fullscreen == 1) {
             fprintf(stderr, "[PC] Attempt 1 failed (%s), retrying with FULLSCREEN_DESKTOP\n",
                     SDL_GetError());
             Uint32 flags = base_flags | SDL_WINDOW_FULLSCREEN_DESKTOP;
-            g_pc_window = SDL_CreateWindow(PC_WINDOW_TITLE,
+            win = SDL_CreateWindow(PC_WINDOW_TITLE,
                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 win_w, win_h, flags);
         }
 
         /* Attempt 3: FULLSCREEN_DESKTOP at display's native resolution */
-        if (!g_pc_window && g_pc_settings.fullscreen) {
+        if (!win && g_pc_settings.fullscreen) {
             fprintf(stderr, "[PC] Attempt 2 failed (%s), retrying fullscreen at display native res\n",
                     SDL_GetError());
             SDL_DisplayMode dm;
@@ -234,24 +191,117 @@ void pc_platform_init(void) {
             }
             fprintf(stderr, "[PC] Display native: %dx%d\n", nat_w, nat_h);
             Uint32 flags = base_flags | SDL_WINDOW_FULLSCREEN_DESKTOP;
-            g_pc_window = SDL_CreateWindow(PC_WINDOW_TITLE,
+            win = SDL_CreateWindow(PC_WINDOW_TITLE,
                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 nat_w, nat_h, flags);
         }
 
         /* Attempt 4: windowed fallback */
-        if (!g_pc_window) {
+        if (!win) {
             fprintf(stderr, "[PC] Attempt 3 failed (%s), retrying windowed 640x480\n",
                     SDL_GetError());
             Uint32 flags = base_flags | SDL_WINDOW_RESIZABLE;
-            g_pc_window = SDL_CreateWindow(PC_WINDOW_TITLE,
+            win = SDL_CreateWindow(PC_WINDOW_TITLE,
                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 640, 480, flags);
         }
     }
+    return win;
+}
 
-    if (!g_pc_window) {
-        fprintf(stderr, "[PC] All SDL_CreateWindow attempts failed: %s\n", SDL_GetError());
+void pc_platform_init(void) {
+#ifdef _WIN32
+    SetProcessDPIAware();
+#endif
+
+    /* Log environment before init to help debug display issues */
+    fprintf(stderr, "[PC] Platform init begin\n");
+    {
+        const char* vd = SDL_getenv("SDL_VIDEODRIVER");
+        const char* da = SDL_getenv("DISPLAY");
+        const char* wa = SDL_getenv("WAYLAND_DISPLAY");
+        fprintf(stderr, "[PC] SDL_VIDEODRIVER=%s  DISPLAY=%s  WAYLAND_DISPLAY=%s\n",
+                vd ? vd : "(not set)",
+                da ? da : "(not set)",
+                wa ? wa : "(not set)");
+    }
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+        fprintf(stderr, "[PC] SDL_Init failed: %s\n", SDL_GetError());
+        exit(1);
+    }
+    fprintf(stderr, "[PC] SDL video driver: %s\n", SDL_GetCurrentVideoDriver());
+
+    /* No resolution in settings.ini: match the panel's native mode (RG35XX
+     * 640x480, RG-34XX SP 720x480, CubeXX 720x720). Explicit ini values win. */
+    pc_settings_autodetect_resolution();
+
+#ifdef PC_USE_GLES
+    /* GLES profile is chosen per attempt in the creation loop below. */
+#else
+    fprintf(stderr, "[PC] GL profile: Core 3.3\n");
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+#ifdef PC_ENHANCEMENTS
+    if (g_pc_settings.msaa > 0) {
+        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+        SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, g_pc_settings.msaa);
+        fprintf(stderr, "[PC] MSAA: %dx\n", g_pc_settings.msaa);
+    }
+#endif
+
+#ifdef PC_USE_GLES
+    /* GL context attempts: GLES 3.1 (Mali-G31 & co.), then GLES 2.0 for
+     * Mali-400-class GPUs (Miyoo A30), then 2.0 with a 16-bit depth buffer.
+     * PC_GLES2=1 skips straight to 2.0. On EGL backends the window's config
+     * depends on the GL attributes, so each attempt recreates the window. */
+    {
+        static const struct { int major, minor, depth; } attempts[] = {
+            { 3, 1, 24 }, { 2, 0, 24 }, { 2, 0, 16 },
+        };
+        const char* force2 = getenv("PC_GLES2");
+        int first = (force2 && atoi(force2) != 0) ? 1 : 0;
+        int n = (int)(sizeof(attempts) / sizeof(attempts[0]));
+        for (int a = first; a < n && !g_pc_gl_context; a++) {
+            fprintf(stderr, "[PC] GL profile: GLES %d.%d (depth %d)\n",
+                    attempts[a].major, attempts[a].minor, attempts[a].depth);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, attempts[a].major);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, attempts[a].minor);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, attempts[a].depth);
+            if (attempts[a].major < 3) {
+                /* GLES2 renders through an offscreen target, so a
+                 * multisampled window buffer is pure cost — and Mali-400
+                 * EGL may have no such config at all. */
+                SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
+                SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 0);
+            }
+            g_pc_window = pc_create_window();
+            if (!g_pc_window) continue;
+            g_pc_gl_context = SDL_GL_CreateContext(g_pc_window);
+            if (!g_pc_gl_context) {
+                fprintf(stderr, "[PC] SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+                SDL_DestroyWindow(g_pc_window);
+                g_pc_window = NULL;
+            }
+        }
+    }
+#else
+    g_pc_window = pc_create_window();
+    if (g_pc_window) {
+        g_pc_gl_context = SDL_GL_CreateContext(g_pc_window);
+        if (!g_pc_gl_context)
+            fprintf(stderr, "[PC] SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+    }
+#endif
+
+    if (!g_pc_window || !g_pc_gl_context) {
+        fprintf(stderr, "[PC] Window/GL context creation failed: %s\n", SDL_GetError());
+        if (g_pc_window) SDL_DestroyWindow(g_pc_window);
         SDL_Quit();
         exit(1);
     }
@@ -260,14 +310,6 @@ void pc_platform_init(void) {
         SDL_GetWindowSize(g_pc_window, &fw, &fh);
         fprintf(stderr, "[PC] Window created: %dx%d flags=0x%x\n",
                 fw, fh, SDL_GetWindowFlags(g_pc_window));
-    }
-
-    g_pc_gl_context = SDL_GL_CreateContext(g_pc_window);
-    if (!g_pc_gl_context) {
-        fprintf(stderr, "[PC] SDL_GL_CreateContext failed: %s\n", SDL_GetError());
-        SDL_DestroyWindow(g_pc_window);
-        SDL_Quit();
-        exit(1);
     }
 
 #ifdef PC_USE_GLES
@@ -289,6 +331,7 @@ void pc_platform_init(void) {
     fprintf(stderr, "[PC] GL Version:  %s\n", glGetString(GL_VERSION));
     fprintf(stderr, "[PC] GL Vendor:   %s\n", glGetString(GL_VENDOR));
     fprintf(stderr, "[PC] GL SL Ver:   %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+    pc_gl_compat_init();
 
     pc_platform_update_window_size();
 
@@ -321,6 +364,7 @@ void pc_platform_shutdown(void) {
     pc_audio_mq_shutdown();
     PADCleanup();
     pc_overlay_shutdown();
+    pc_gl_compat_shutdown();
     pc_texture_pack_shutdown();
     pc_gx_shutdown();
 
@@ -336,9 +380,20 @@ void pc_platform_shutdown(void) {
 }
 
 void pc_platform_update_window_size(void) {
-    SDL_GL_GetDrawableSize(g_pc_window, &g_pc_window_w, &g_pc_window_h);
-    if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
-    if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+    SDL_GL_GetDrawableSize(g_pc_window, &g_pc_phys_w, &g_pc_phys_h);
+    if (g_pc_phys_w <= 0) g_pc_phys_w = PC_SCREEN_WIDTH;
+    if (g_pc_phys_h <= 0) g_pc_phys_h = PC_SCREEN_HEIGHT;
+
+    /* g_pc_window_w/h are the LOGICAL (as-viewed) screen; on a rotated
+     * panel the present pass maps them onto the physical drawable. */
+    pc_gl_compat_pick_rotation(g_pc_phys_w, g_pc_phys_h, g_pc_settings.fullscreen != 0);
+    if (g_pc_rotation == 90 || g_pc_rotation == 270) {
+        g_pc_window_w = g_pc_phys_h;
+        g_pc_window_h = g_pc_phys_w;
+    } else {
+        g_pc_window_w = g_pc_phys_w;
+        g_pc_window_h = g_pc_phys_h;
+    }
 
     /* In fullscreen mode the SDL window is always native-res, so use the window_size
      * preset as the target render resolution instead of the full drawable size.
@@ -374,7 +429,9 @@ void pc_platform_swap_buffers(void) {
     SDL_GL_SwapWindow(g_pc_window);
 }
 
-static int pc_confirm_quit(void) {
+/* Returns 1 = quit, 0 = cancelled, -1 = no message box available
+ * (fullscreen handhelds: no window manager). */
+static int pc_show_quit_dialog(void) {
     const SDL_MessageBoxButtonData buttons[] = {
         { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Cancel" },
         { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Quit" },
@@ -386,8 +443,29 @@ static int pc_confirm_quit(void) {
     };
     int button = 0;
     if (SDL_ShowMessageBox(&data, &button) < 0)
-        return 1; /* on error, just quit */
+        return -1;
     return button == 1;
+}
+
+/* Window close / SDL_QUIT (also how a launcher asks us to stop): never
+ * blocks when no dialog can be shown. */
+static int pc_confirm_quit(void) {
+    return pc_show_quit_dialog() != 0;
+}
+
+/* Escape key — the Miyoo A30's Menu button. Without a dialog, one stray
+ * press used to quit instantly (losing unsaved progress); require a second
+ * press within 2s, with an on-screen prompt. */
+#define PC_QUIT_CONFIRM_MS 2000
+static int pc_confirm_quit_key(void) {
+    static Uint32 s_armed_at = 0;
+    int r = pc_show_quit_dialog();
+    if (r >= 0) return r;
+    Uint32 now = SDL_GetTicks();
+    if (s_armed_at && now - s_armed_at < PC_QUIT_CONFIRM_MS) return 1;
+    s_armed_at = now;
+    pc_overlay_toast("Press MENU again to quit", PC_QUIT_CONFIRM_MS);
+    return 0;
 }
 
 int pc_platform_poll_events(void) {
@@ -409,8 +487,8 @@ int pc_platform_poll_events(void) {
                 }
                 break;
             case SDL_KEYDOWN:
-                if (event.key.keysym.sym == SDLK_ESCAPE) {
-                    if (pc_confirm_quit()) {
+                if (event.key.keysym.sym == SDLK_ESCAPE && !event.key.repeat) {
+                    if (pc_confirm_quit_key()) {
                         g_pc_running = 0;
                         return 0;
                     }
@@ -419,7 +497,11 @@ int pc_platform_poll_events(void) {
                     g_pc_no_framelimit ^= 1;
                     printf("[PC] Frame limiter %s\n", g_pc_no_framelimit ? "OFF" : "ON");
                 }
-                if (event.key.keysym.sym == SDLK_TAB && !event.key.repeat) {
+                /* Settings menu key (keybindings.ini "Menu", default Tab).
+                 * Not while the Controls tab is capturing a key — the menu
+                 * key must be bindable without closing the menu. */
+                if (!event.key.repeat && !pc_overlay_capturing() &&
+                    (PCInputCode)event.key.keysym.scancode == g_pc_keybindings.menu) {
                     pc_overlay_menu_toggle();
                 }
                 pc_typing_handle_event(&event);
@@ -428,7 +510,9 @@ int pc_platform_poll_events(void) {
                 pc_typing_handle_event(&event);
                 break;
             case SDL_CONTROLLERBUTTONDOWN:
-                if (event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                if (!pc_overlay_capturing() &&
+                    (event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK ||
+                     g_pc_keybindings.menu == PC_INPUT_GAMEPAD_BTN(event.cbutton.button))) {
                     pc_overlay_menu_toggle();
                 }
                 break;

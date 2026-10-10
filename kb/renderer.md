@@ -96,6 +96,75 @@ calls the GameCube GX API; these files implement it on GL/GLES.
 - EFB captures (GXCopyTex) stay GPU-side: blit into a texture via FBO
   (`pc_gx_efb_capture_*`), no glReadPixels round trip (PC_ENHANCEMENTS).
 
+## GLES 2.0 path (Miyoo A30 / Mali-400, 2026-10-07 — not device-verified)
+
+- Context loop in pc_main.c: GLES 3.1 → 2.0 → 2.0 with 16-bit depth
+  (window recreated per attempt: EGL config depends on the attributes).
+  `PC_GLES2=1` starts at 2.0 AND forces the GLES2 code path on a 3.x
+  context, hiding 3.x-only entry points — that's how to exercise it in the
+  Mesa smoke harness (`PC_GLES2_NO_VAO=1` also drops VAOs).
+- `pc_gl_compat.c`: `g_pc_gles2`, OES aliasing (VAO, program binary, base
+  vertex), no-op VAO stubs when there's no OES_vertex_array_object
+  (`g_pc_has_vao=0`: anything drawing with its own attribs must leave via
+  `pc_gx_rebind_vertex_state()` — the overlay and present quad do),
+  `g_pc_has_npot` (NPOT + REPEAT → CLAMP in `gx_gl_wrap`).
+- Shaders: `generate_frag` emits GLSL ES 1.00 when `g_pc_gles2` (varying,
+  texture2D, gl_FragColor via #define, mediump int). Swap tables use
+  one-hot dot products instead of `v[i]` / `u_swap_table[i]`. Per-stage
+  texcoord selection moved into `shaders/default_es2.vert` (outputs
+  v_stc0..2) so texture2D gets untouched varyings — Mali-400 fragment math
+  is fp16 but direct varying lookups aren't. Keep default_es2.vert's math
+  in sync with default.vert. GLES3 output is byte-identical to before
+  (checked over all 101 seed keys) — no SDC_VERSION bump was needed.
+  No uber-shader fallback on GLES2.
+- Present pass: when `pc_gl_present_needed()` (GLES2 or rotation≠0) the
+  game always renders into s_render_fbo; `pc_gx_blit_to_screen` draws it as
+  a (rotated) quad via `pc_gl_draw_tex_quad`, which saves/restores all GL
+  state GX caches. The overlay draws straight onto the panel afterwards,
+  rotating its clip-space verts (`ov_flush_verts`) — no extra full-screen
+  pass. g_pc_window_w/h are LOGICAL (as-viewed) dims; g_pc_phys_w/h are
+  the drawable.
+- EFB copies without glBlitFramebuffer: quad from s_render_tex into the
+  capture texture with flipped v. Fixed in passing (all GL flavours): the
+  blit path used to read FB 0 and leave DRAW_FRAMEBUFFER=0 even when the
+  game renders into the render-scale FBO (render_scale < 100 lost
+  everything drawn after a GXCopyTex); it now reads/rebinds the game's
+  actual target (`pc_gx_game_fbo`).
+- **GLES2 audit (2026-10-07, after the A30 played correctly)**:
+  - Done: identity-swap specialization. AC only ever selects TEV swap
+    table 0 (identity; emu64.c sets tables 1-3 but no stage uses them), so
+    GLES2 keys carry `ShaderKey._pad` bit0 = "a stage really swaps" and the
+    common shader drops applySwap (~25 fp16 ALU ops per stage per pixel).
+    Seed keys have _pad=0 → boot warm-up compiles exactly the no-swap
+    variants. GLES3 keys/output unchanged (verified byte-identical, 101
+    keys). GLES2 disk-cache hash salt bumped 0x32→0x33.
+  - Done: discard render-FBO depth at frame end (EXT_discard_framebuffer
+    on GLES2, glInvalidateFramebuffer on GLES3) — saves the depth tile
+    write-back on tile-based Malis.
+  - Done earlier: matrices CPU-transposed (GL_TRUE transpose is invalid on
+    GLES2), legacy per-flush VBO on GLES2.
+  - Checked, fine: no GX_POINTS anywhere (lines only in NES/debug draws);
+    PC_GL_CHECK compiled out; no glGet in per-draw paths; NPOT + depth24
+    supported on the A30 Mali-400.
+  - Done: compact texture upload (`gx_upload_rgba` in pc_gx_texture.c,
+    default on for GLES2, `PC_TEX16=0/1` overrides). Content-based, after
+    the (unchanged, byte-identical) RGBA8 decode: grey → LUMINANCE /
+    LUMINANCE_ALPHA, else exact 565 / 5551 / 4444, else RGBA8. "Exact" =
+    every byte is producible by the decoders' own truncating expansion
+    (v*255/(2^n-1)) — inverse tables s_inv5/6/4 — so the GPU samples
+    within 1/255 of the old upload. Unit-tested per GX format
+    (/tmp harness: I4/I8/IA4/IA8 → LA8 lossless; RGB565, opaque RGB5A3,
+    RGB565/IA8/opaque-RGB5A3 palettes → 16-bit; translucent RGB5A3,
+    RGBA8, CMPR stay RGBA8). Verbose log: `[PC/TEX] compact upload: ...`
+    at 16/32/64/128 then every 256 uploads. NOTE for host-side tests:
+    pc_types.h `u32` is `unsigned long` → 8 bytes on 64-bit hosts, which
+    breaks decode_CI8's u32 palette copy there (device is fine).
+    Possible next step (lossy, not done): translucent RGB5A3 → 4444.
+  - Open ideas (not done): reuse EFB-capture textures instead of
+    glGenTextures per GXCopyTex; texture cache is capped by count (2048),
+    not bytes — watch memory on 512 MB devices; analog stick via spruce's
+    virtual pad.
+
 ## Frame flow
 
 `VIWaitForRetrace` (pc_vi.c): poll events → (frameskip fast path) → blit

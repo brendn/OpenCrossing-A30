@@ -671,6 +671,12 @@ static void neg_cache_insert(xxh_u64 key) {
 /* --- Public API --- */
 
 static void check_compressed_texture_support(void) {
+    if (!glGetStringi) {
+        /* GLES 2.0: no indexed query, one space-separated string */
+        const char* all = (const char*)glGetString(GL_EXTENSIONS);
+        if (all && strstr(all, "GL_EXT_texture_compression_s3tc")) g_has_s3tc = 1;
+        return;
+    }
     GLint num_ext = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &num_ext);
     for (GLint i = 0; i < num_ext; i++) {

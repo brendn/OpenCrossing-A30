@@ -49,18 +49,21 @@ typedef struct {
     PCInputCode dpad_down;
     PCInputCode dpad_left;
     PCInputCode dpad_right;
+
+    /* OpenCrossing settings menu toggle (default Tab; Miyoo A30: L2 = E) */
+    PCInputCode menu;
 } PCKeybindings;
 
 extern PCKeybindings g_pc_keybindings;
 
-#define KB_COUNT 20  /* number of bindable actions, matches s_entries[] in pc_keybindings.c */
+#define KB_COUNT 21  /* number of bindable actions, matches s_entries[] in pc_keybindings.c */
 
 void pc_keybindings_load(void);
 void pc_keybindings_save(void);        /* write current bindings to keybindings.ini */
 void pc_keybindings_reset(void);       /* restore hard-coded defaults and save */
 int  pc_keybindings_uses_gamepad(void); /* 1 if any binding is a gamepad button */
 
-/* For overlay: idx 0..KB_COUNT-1 matches s_entries[] order (A, B, X, Y, Start, Z, L, R, Stick*, CStick*, DPad*) */
+/* For overlay: idx 0..KB_COUNT-1 matches s_entries[] order (A, B, X, Y, Start, Z, L, R, Stick*, CStick*, DPad*, Menu) */
 const char*  pc_keybinding_label(int idx);  /* human-readable name, e.g. "Stick Up" */
 PCInputCode* pc_keybinding_ptr(int idx);    /* pointer into g_pc_keybindings for get/set */
 

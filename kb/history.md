@@ -96,6 +96,20 @@
   auto-detect path (kb/build-test.md); device log stdout tail is lost on
   unclean unmount — see kb/device.md "Reading device logs".
 
+- **2026-10-07** — Miyoo A30 port started (user owns an A30 on spruceOS;
+  "never got this port working" there before). Chose a GLES 2.0 renderer
+  path in the same binary codebase (context fallback 3.1→2.0) rather than
+  gl4es, plus app-side rotation for the portrait panel and a separate
+  glibc-2.23 build + spruce A30PORTS package (no PortMaster on the A30).
+  GLES3 behaviour on H700 devices deliberately unchanged (shader output
+  byte-identical); one real fix rode along: render_scale<100 EFB copies.
+  Awaiting first device test.
+- **2026-10-10** — A30 work split into its own fork, brendn/OpenCrossing-A30
+  (parent TechProGabe/OpenCrossing-Anbernic). Device-verified ~60 fps at
+  100% render scale; launcher first-run default kept at 75% to save
+  battery (user decision). Binding fixes confirmed on device. README
+  rewritten for the A30 fork.
+
 ## Standing decisions
 
 - Device build (armhf) is the product; desktop builds exist for development.

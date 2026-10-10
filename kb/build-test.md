@@ -17,11 +17,49 @@ xauth — that's the container, not the binary; use the harness instead).
 **Colima/docker gotcha**: `exec format error` from an arm container means
 qemu binfmt handlers aren't registered in the colima VM — run
 `docker run --privileged --rm tonistiigi/binfmt --install arm` once per VM
-(2026-07-15). Also: legacy builder (no buildx) silently ignores
+(2026-07-15). **Needed again after every `colima stop`/`start`** — the
+registration doesn't survive a VM restart (2026-10-08: both builds failed
+with exec format error right after `colima start`). Also: legacy builder (no buildx) silently ignores
 `--platform` when an arm64 base image is cached. Verify any image/container
 with `uname -m` → must print `armv7l`. `acgc-smoke-deps:armhf` was once
 silently arm64 and had to be rebuilt via `docker commit` from an explicit
 `--platform linux/arm/v7` container.
+
+## Miyoo A30 build (2026-10-07)
+
+```bash
+docker run --rm --platform linux/arm/v7 -v "$PWD":/work \
+  ubuntu:16.04 bash /work/pc/build-a30-docker.sh
+./a30/make-package.sh   # → a30/AnimalCrossing-ac-gc-a30.zip
+```
+
+Ubuntu 16.04 = glibc 2.23 (the A30's). GCC 9 from the
+ubuntu-toolchain-r PPA (C++17), static libstdc++/libgcc, Cortex-A7 tuning.
+CMake 3.16 and SDL2 2.26.5 (import lib + headers only) are built from
+source into `pc/build-a30-tools/` on first run (slow under qemu, cached
+after). Links a stub `libGLESv2.so` SONAME (see kb/device.md). The script
+fails if the binary needs > GLIBC_2.23 or dynamic libstdc++.
+First run 2026-10-07: OK (GCC 9.4.0; highest symbol GLIBC_2.17 — same
+ceiling as the A30's PPSSPP; NEEDED libSDL2-2.0.so.0, libGLESv2.so, libdl,
+libpthread, libm, libc). First run ~1h under qemu (CMake+SDL2 from source,
+then cached in pc/build-a30-tools/); apt + PPA setup repeats every run.
+The macOS native build can't work on Apple Silicon (32-bit only project).
+
+GLES2 path in the smoke harness: run the armhf smoke with `PC_GLES2=1`
+(and once with `PC_GLES2_NO_VAO=1`) in the container env — Mesa hands
+back a 3.x context, the flag forces the GLES2 code path anyway.
+Rotation can be exercised the same way with `PC_ROTATE=90`.
+**Also run with `-e MESA_GLES_VERSION_OVERRIDE=2.0`**: that gives a real
+GLES 2.0 context with GLES2 validation. PC_GLES2=1 alone on a 3.x context
+missed the transpose=GL_TRUE matrix uploads that black-screened the A30.
+2026-10-07 matrix (armhf, Mesa 22.3.6): GLES3 x2, PC_GLES2=1 x2, and
+PC_GLES2=1+PC_GLES2_NO_VAO=1+PC_ROTATE=90 all survived 120s into the
+title screen with 0 shader compile/link failures on the GLES2 path;
+disk cache preloads on 2nd run in both modes. Xvfb screenshots (xwd via
+x11-apps in the container) showed GLES2 matching GLES3 and correct 90°
+CCW rotation. Known Mesa-only noise: the GLES3 uber-shader fallback fails
+to link ("u_light_pos mismatching precision") — pre-existing, Mali
+accepts it, specialized shaders unaffected.
 
 ## Test harness (`harness/`)
 

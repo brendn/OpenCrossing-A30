@@ -1,14 +1,17 @@
 # CLAUDE.md
 
-**OpenCrossing-Anbernic** (repo GabeConway/OpenCrossing-Anbernic, renamed
-2026-07-14 from animal-crossing-anbernic for trademark hygiene) — native
-Animal Crossing (GameCube decomp) build for Anbernic handhelds, standalone
-project since 2026-07-13, bootstrapped from the Dia2809 fork of
-flyngmt/ACGC-PC-Port (credited in README). Target: **RG-34XX SP** (Allwinner
-H700 Cortex-A53 armhf, Mali-G31 GLES-only, 720x480, muOS + PortMaster).
-Community-confirmed also on RG28XX/Knulli. Runtime paths (`ports/ac-gc/`,
-launcher name "Animal Crossing.sh") deliberately unchanged by the rename —
-renaming those would break existing installs.
+**OpenCrossing-A30** (repo brendn/OpenCrossing-A30, forked 2026-10-10 from
+TechProGabe/OpenCrossing-Anbernic, formerly GabeConway/OpenCrossing-Anbernic)
+— native Animal Crossing (GameCube decomp) build for the **Miyoo A30**
+(Allwinner A33 Cortex-A7 armhf, Mali-400 MP2 GLES 2.0 only, 480x640
+portrait-scanned panel, spruceOS, glibc 2.23, no PortMaster). Upstream is an
+Anbernic H700 port (RG-34XX SP, Mali-G31 GLES 3.x, muOS + PortMaster),
+itself bootstrapped from the Dia2809 fork of flyngmt/ACGC-PC-Port (all
+credited in README). The A30 support is a GLES 2.0 path in the same
+codebase (`PC_GLES2=1`, `pc_gl_compat.c`); the GLES3/H700 path is kept
+working and byte-identical so changes can flow back upstream. Runtime paths
+(`ports/ac-gc/`, `Roms/A30PORTS/ac-gc/`, launcher name "Animal Crossing.sh")
+are deliberately stable — renaming them would break existing installs.
 
 ## Ground rules
 
@@ -21,7 +24,10 @@ renaming those would break existing installs.
 - After any renderer/texture/shader change: build armhf in Docker and run
   `./harness/smoke.sh armhf` (twice, to also exercise the shader disk cache).
 - Launcher sync: `port_files/Animal Crossing.sh` is source of truth;
-  keep `portmaster/Animal Crossing.sh` (release zip copy) in sync.
+  keep `portmaster/Animal Crossing.sh` (release zip copy) in sync. The A30
+  launcher `a30/Animal Crossing.sh` is separate (not covered by that rule).
+- A30 packaging: `a30/make-package.sh` builds the zip in a temp dir; never
+  commit `a30/Roms/` or `a30/*.zip` (gitignored).
 
 ## Knowledge base — read on demand, don't guess
 
@@ -47,13 +53,17 @@ docker run --rm --platform linux/arm/v7 -v "$PWD":/work \
   debian:bookworm bash /work/pc/build-armhf-docker.sh
 # boot test with rom
 ./harness/smoke.sh armhf
-# deploy (SD card mounted as ROMS)
-cp pc/build-armhf/bin/AnimalCrossing "/Volumes/ROMS/ports/ac-gc/AnimalCrossing" && sync
+# Miyoo A30 build (glibc 2.23, GLES2 path) — see kb/device.md "Miyoo A30"
+docker run --rm --platform linux/arm/v7 -v "$PWD":/work \
+  ubuntu:16.04 bash /work/pc/build-a30-docker.sh
+# A30 release zip (output: a30/AnimalCrossing-ac-gc-a30.zip)
+./a30/make-package.sh
+# deploy to A30 (spruceOS SD card mounted as SDCARD)
+cp pc/build-a30/bin/AnimalCrossing "/Volumes/SDCARD/Roms/A30PORTS/ac-gc/AnimalCrossing" && sync
 ```
 
-## Status (2026-07-13)
+## Status (2026-10-10)
 
-Works on device: rendering, controls, saves, audio. Two perf passes done
-(see kb/perf.md). Second pass (dev branch: -O2 for game code + NEON, NEON
-decoders, decode budget, draw-call merging) is **awaiting device testing** —
-README carries a "not tested end-to-end" notice until a full playthrough.
+Works on the A30: rendering, controls (binding fixes device-confirmed),
+saves, audio — ~60 fps at 100% render scale; launcher defaults to 75% for
+battery. Upstream H700 status/perf history: kb/perf.md, kb/history.md.

@@ -6,6 +6,7 @@
  * Massive win on Mali-G52 which hates dynamic branching.
  */
 #include "pc_gx_internal.h"
+#include "pc_gl_compat.h"
 #include <stdarg.h>
 
 /* --- file I/O --- */
@@ -40,9 +41,12 @@ static char* load_shader(const char* filename) {
 static GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
 #ifdef PC_USE_GLES
-    const char* version_line = "#version 310 es\n";
+    /* GLES2 (Mali-400): GLSL ES 1.00, and the fragment unit has no highp
+     * at all — mediump ints are plenty for the small TEV enums/refs. */
+    const char* version_line = g_pc_gles2 ? "#version 100\n" : "#version 310 es\n";
     const char* precision_line = (type == GL_FRAGMENT_SHADER)
-        ? "precision mediump float;\nprecision highp int;\n"
+        ? (g_pc_gles2 ? "precision mediump float;\nprecision mediump int;\n"
+                      : "precision mediump float;\nprecision highp int;\n")
         : "precision highp float;\nprecision highp int;\n";
     const char* past_version = source;
     if (strncmp(source, "#version", 8) == 0) {
@@ -164,6 +168,22 @@ static void build_key(PCGXState* st, ShaderKey* k) {
         k->s[i].alpha_out = (u8)ts->alpha_out;
         k->s[i].k_color_sel = (u8)ts->k_color_sel;
         k->s[i].k_alpha_sel = (u8)ts->k_alpha_sel;
+    }
+    /* GLES2: _pad bit0 = some stage swaps channels (non-identity ras/tex
+     * swap table). AC only ever selects the identity table, so the common
+     * GLES2 shader drops the swap math entirely (Mali-400 fragment ALU is
+     * the A30's bottleneck). Always 0 on GLES3, whose shaders keep the
+     * dynamic swap — keys/seed/output unchanged there. */
+    if (g_pc_gles2) {
+        for (int i = 0; i < ns; i++) {
+            const PCGXTevSwapTable* r = &st->tev_swap_table[st->tev_stages[i].ras_swap & 3];
+            const PCGXTevSwapTable* t = &st->tev_swap_table[st->tev_stages[i].tex_swap & 3];
+            if (r->r != 0 || r->g != 1 || r->b != 2 || r->a != 3 ||
+                t->r != 0 || t->g != 1 || t->b != 2 || t->a != 3) {
+                k->_pad = 1;
+                break;
+            }
+        }
     }
 }
 
@@ -352,21 +372,40 @@ static void emit_write_a(SB* sb, int out_reg, int do_clamp) {
         sb_printf(sb, "    %s.a = aResult;\n", reg[out_reg & 3]);
 }
 
-static char* generate_frag(PCGXState* st) {
+static char* generate_frag(PCGXState* st, int need_swap) {
     char* buf = (char*)malloc(FRAG_BUF);
     if (!buf) return NULL;
     SB sb = { buf, 0, FRAG_BUF };
     int ns = st->num_tev_stages;
     if (ns > PC_GX_MAX_TEV_STAGES) ns = PC_GX_MAX_TEV_STAGES;
 
+    /* GLES2 emits GLSL ES 1.00: varyings, texture2D, gl_FragColor, no
+     * dynamic vector/uniform-array indexing. Per-stage texcoords are
+     * selected in default_es2.vert so they reach texture2D as untouched
+     * varyings (Mali-400 then samples at full precision; fragment math is
+     * fp16 only). */
+    const int es2 = g_pc_gles2;
+    /* GLES3 always emits the dynamic swap; GLES2 only when the key says a
+     * stage really swaps (ShaderKey._pad, see build_key). */
+    const int emit_swap = !es2 || need_swap;
+
     /* --- Header & inputs --- */
     P("#version 330 core\n");
-    P("in vec4 v_color;\n");
-    P("in vec2 v_texcoord0;\n");
-    P("in vec2 v_texcoord1;\n");
-    P("in vec3 v_normal;\n");
-    P("in float v_fog_z;\n");
-    P("in vec3 v_light_accum;\n\n");
+    if (es2) {
+        P("#define fragColor gl_FragColor\n");
+        P("varying vec4 v_color;\n");
+        for (int s = 0; s < ns; s++)
+            P("varying vec2 v_stc%d;\n", s);
+        P("varying float v_fog_z;\n");
+        P("varying vec3 v_light_accum;\n\n");
+    } else {
+        P("in vec4 v_color;\n");
+        P("in vec2 v_texcoord0;\n");
+        P("in vec2 v_texcoord1;\n");
+        P("in vec3 v_normal;\n");
+        P("in float v_fog_z;\n");
+        P("in vec3 v_light_accum;\n\n");
+    }
 
     /* --- Uniforms: only declare what this specific shader reads.
      * pc_gx.c's uniform upload uses if(loc >= 0), so undeclared
@@ -399,7 +438,7 @@ static char* generate_frag(PCGXState* st) {
     for (int s = 0; s < ns; s++) {
         P("uniform sampler2D u_texture%d;\n", s);
         P("uniform int u_use_texture%d;\n", s);
-        P("uniform int u_tev%d_tc_src;\n", s);
+        if (!es2) P("uniform int u_tev%d_tc_src;\n", s);
     }
 
     /* Material/ambient colors — only if lighting path reads them */
@@ -422,35 +461,58 @@ static char* generate_frag(PCGXState* st) {
     }
 
     /* Swap tables */
-    P("uniform ivec4 u_swap_table[4];\n");
-    for (int s = 0; s < ns; s++)
-        P("uniform ivec2 u_tev%d_swap;\n", s);
+    if (emit_swap) {
+        P("uniform ivec4 u_swap_table[4];\n");
+        for (int s = 0; s < ns; s++)
+            P("uniform ivec2 u_tev%d_swap;\n", s);
+    }
 
-    P("\nout vec4 fragColor;\n\n");
+    if (!es2) P("\nout vec4 fragColor;\n\n");
 
     /* --- Swap helper (still needed for dynamic swap tables) --- */
-    P("vec4 applySwap(vec4 v, ivec4 sw) {\n");
-    P("    return vec4(v[sw.x], v[sw.y], v[sw.z], v[sw.w]);\n");
-    P("}\n\n");
+    if (!emit_swap) {
+        /* identity swaps: nothing to emit */
+    } else if (es2) {
+        /* One-hot selects instead of v[i] / u_swap_table[i] (indexing by
+         * non-constants isn't guaranteed in ES 1.00 fragment shaders) */
+        P("vec4 swSel(float i) { return vec4(equal(vec4(i), vec4(0.0, 1.0, 2.0, 3.0))); }\n");
+        P("vec4 applySwap(vec4 v, int tbl) {\n");
+        P("    vec4 w = swSel(float(tbl));\n");
+        P("    vec4 sw = w.x * vec4(u_swap_table[0]) + w.y * vec4(u_swap_table[1])\n");
+        P("            + w.z * vec4(u_swap_table[2]) + w.w * vec4(u_swap_table[3]);\n");
+        P("    return vec4(dot(v, swSel(sw.x)), dot(v, swSel(sw.y)),\n");
+        P("                dot(v, swSel(sw.z)), dot(v, swSel(sw.w)));\n");
+        P("}\n\n");
+    } else {
+        P("vec4 applySwap(vec4 v, ivec4 sw) {\n");
+        P("    return vec4(v[sw.x], v[sw.y], v[sw.z], v[sw.w]);\n");
+        P("}\n\n");
+    }
 
     /* --- main() --- */
     P("void main() {\n");
-    P("    vec2 tc0 = v_texcoord0;\n");
-    P("    vec2 tc1 = v_texcoord1;\n\n");
+    if (!es2) {
+        P("    vec2 tc0 = v_texcoord0;\n");
+        P("    vec2 tc1 = v_texcoord1;\n\n");
 
-    /* Texcoord selection per stage */
-    for (int s = 0; s < ns; s++) {
-        P("    vec2 stc%d = (u_tev%d_tc_src == 0) ? tc0 : tc1;\n", s, s);
+        /* Texcoord selection per stage */
+        for (int s = 0; s < ns; s++) {
+            P("    vec2 stc%d = (u_tev%d_tc_src == 0) ? tc0 : tc1;\n", s, s);
+        }
+        P("\n");
     }
-    P("\n");
 
     /* Texture sampling — only for stages that exist */
     const char* tex_names[] = { "u_texture0", "u_texture1", "u_texture2" };
     const char* use_names[] = { "u_use_texture0", "u_use_texture1", "u_use_texture2" };
     for (int s = 0; s < ns; s++) {
         P("    vec4 texColor%d = vec4(1.0);\n", s);
-        P("    if (%s != 0) texColor%d = texture(%s, stc%d);\n",
-          use_names[s], s, tex_names[s], s);
+        if (es2)
+            P("    if (%s != 0) texColor%d = texture2D(%s, v_stc%d);\n",
+              use_names[s], s, tex_names[s], s);
+        else
+            P("    if (%s != 0) texColor%d = texture(%s, stc%d);\n",
+              use_names[s], s, tex_names[s], s);
     }
     P("\n");
 
@@ -499,8 +561,16 @@ static char* generate_frag(PCGXState* st) {
 
         P("    /* TEV stage %d */\n", s);
         P("    {\n");
-        P("        vec4 sTex = applySwap(texColor%d, u_swap_table[%s.y]);\n", s, swap_names[s]);
-        P("        vec4 sRas = applySwap(rasColor,  u_swap_table[%s.x]);\n", swap_names[s]);
+        if (!emit_swap) {
+            P("        vec4 sTex = texColor%d;\n", s);
+            P("        vec4 sRas = rasColor;\n");
+        } else if (es2) {
+            P("        vec4 sTex = applySwap(texColor%d, %s.y);\n", s, swap_names[s]);
+            P("        vec4 sRas = applySwap(rasColor,  %s.x);\n", swap_names[s]);
+        } else {
+            P("        vec4 sTex = applySwap(texColor%d, u_swap_table[%s.y]);\n", s, swap_names[s]);
+            P("        vec4 sRas = applySwap(rasColor,  u_swap_table[%s.x]);\n", swap_names[s]);
+        }
 
         /* Konst color/alpha for this stage */
         emit_kc(&sb, ts->k_color_sel);
@@ -615,6 +685,11 @@ static u32 sdc_driver_hash(void) {
             h *= 0x01000193u;
         }
     }
+    /* GLES2-path programs (different vertex shader + GLSL dialect) must not
+     * be loaded by a GLES3 run on the same driver or vice versa — happens
+     * with PC_GLES2=1 on a 3.x context. GLES3 hash left unchanged. */
+    if (g_pc_gles2)
+        h = (h ^ 0x33u) * 0x01000193u;  /* bump on GLES2-only shader changes */
     return h;
 }
 
@@ -773,7 +848,7 @@ static void sdc_warm_from_seed(void) {
 
         memset(st, 0, sizeof(PCGXState));
         state_from_key(&key, st);
-        char* frag_src = generate_frag(st);
+        char* frag_src = generate_frag(st, key._pad & 1);
         if (!frag_src) continue;
         GLuint prog = 0;
         GLuint fs = compile_shader(GL_FRAGMENT_SHADER, frag_src);
@@ -798,9 +873,10 @@ static void sdc_warm_from_seed(void) {
  * =================================================================== */
 void pc_gx_tev_init(void) {
     /* Compile vertex shader once (kept alive for all programs) */
-    char* vs_src = load_shader("default.vert");
+    const char* vs_file = g_pc_gles2 ? "default_es2.vert" : "default.vert";
+    char* vs_src = load_shader(vs_file);
     if (!vs_src) {
-        fprintf(stderr, "FATAL: Missing shaders/default.vert\n");
+        fprintf(stderr, "FATAL: Missing shaders/%s\n", vs_file);
         exit(1);
     }
     s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
@@ -810,8 +886,9 @@ void pc_gx_tev_init(void) {
         exit(1);
     }
 
-    /* Load uber-shader as fallback */
-    char* fs_src = load_shader("default.frag");
+    /* Load uber-shader as fallback (GLSL 3.x only — no GLES2 variant;
+     * there a failed specialization just skips the draw) */
+    char* fs_src = g_pc_gles2 ? NULL : load_shader("default.frag");
     if (fs_src) {
         GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
         if (fs) s_fallback = link_with_vs(fs);
@@ -864,15 +941,20 @@ GLuint pc_gx_tev_get_shader(PCGXState* state) {
 
     /* Cache miss: generate specialized fragment shader */
     GLuint prog = 0;
-    char* frag_src = generate_frag(state);
+    char* frag_src = generate_frag(state, key._pad & 1);
     if (frag_src) {
         GLuint fs = compile_shader(GL_FRAGMENT_SHADER, frag_src);
         if (fs) {
             prog = link_with_vs(fs);
         }
         if (!prog) {
-            /* Compilation failed — dump source for debugging */
-            fprintf(stderr, "[PC/TEV] Specialized shader failed to compile. Source:\n%s\n", frag_src);
+            /* Compilation failed — dump source for debugging (capped: with no
+             * fallback (GLES2) this retries every draw of the config) */
+            static int s_fail_dumps = 0;
+            if (s_fail_dumps < 5) {
+                s_fail_dumps++;
+                fprintf(stderr, "[PC/TEV] Specialized shader failed to compile. Source:\n%s\n", frag_src);
+            }
         }
         free(frag_src);
     }

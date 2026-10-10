@@ -426,6 +426,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_settings.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_keybindings.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_overlay.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gl_compat.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_stubs_cpp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_assets.c
@@ -613,6 +614,8 @@ add_custom_command(TARGET ac_pc POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/default.vert"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/default.frag"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/default_es2.vert"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_seed.bin"
         "${CMAKE_BINARY_DIR}/bin/shaders/"
     COMMENT "Copying shader files to bin/shaders/"
 )

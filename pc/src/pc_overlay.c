@@ -3,6 +3,7 @@
 #include "pc_overlay.h"
 #include "pc_settings.h"
 #include "pc_keybindings.h"
+#include "pc_gl_compat.h"
 
 /* ---- Vertex type ---- */
 typedef struct { float x, y, u, v, r, g, b, a; } OvVtx;
@@ -495,6 +496,18 @@ static const char* ov_frag_src =
     "uniform sampler2D u_font;\n"
     "out vec4 fragColor;\n"
     "void main(){float a=texture(u_font,v_uv).r;fragColor=vec4(v_col.rgb,v_col.a*a);}\n";
+/* GLES 2.0 (Mali-400): GLSL ES 1.00, font texture is LUMINANCE */
+static const char* ov_vert_src_es2 =
+    "#version 100\n"
+    "attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_col;\n"
+    "varying vec2 v_uv; varying vec4 v_col;\n"
+    "void main(){gl_Position=vec4(a_pos,0.0,1.0);v_uv=a_uv;v_col=a_col;}\n";
+static const char* ov_frag_src_es2 =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec2 v_uv; varying vec4 v_col;\n"
+    "uniform sampler2D u_font;\n"
+    "void main(){float a=texture2D(u_font,v_uv).r;gl_FragColor=vec4(v_col.rgb,v_col.a*a);}\n";
 #else
 static const char* ov_vert_src =
     "#version 330 core\n"
@@ -679,6 +692,40 @@ static void ov_string_right(const char* s, float x_right, float y, float cw, flo
     ov_string(s, x_right - len * cw, y, cw, ch, r, g, b, a);
 }
 
+int pc_overlay_capturing(void) {
+    return g_pc_menu_open && ctrl_capture_idx >= 0;
+}
+
+/* ---- Toast: short centered message (e.g. quit confirmation) ---- */
+static char   s_toast[64];
+static Uint32 s_toast_until = 0;
+
+void pc_overlay_toast(const char* msg, Uint32 ms) {
+    snprintf(s_toast, sizeof(s_toast), "%s", msg);
+    s_toast_until = SDL_GetTicks() + ms;
+}
+
+static int toast_active(void) {
+    return s_toast_until && (Sint32)(s_toast_until - SDL_GetTicks()) > 0;
+}
+
+static void draw_toast(float cw, float ch, float pad) {
+    float pw = (float)strlen(s_toast) * cw + 2.0f * pad;
+    float ph = ch + 2.0f * pad;
+    float px = ((float)g_pc_window_w - pw) * 0.5f;
+    float py = (float)g_pc_window_h * 0.75f;
+    ov_quad(px, py, pw, ph, BG_U, BG_V, BG_U, BG_V, 0, 0, 0, 0.75f);
+    ov_string(s_toast, px + pad, py + pad, cw, ch, 1, 1, 1, 1);
+}
+
+/* Keyboard state for overlay navigation keys, ignoring the menu key so
+ * the key that opened the menu (A30: L2 = E) never also switches tabs. */
+static int ov_nav_key(const Uint8* keys, int nkeys, PCInputCode code) {
+    if (code < 0 || code >= nkeys || code >= SDL_NUM_SCANCODES) return 0;  /* unbound / mouse / gamepad */
+    if (code == g_pc_keybindings.menu) return 0;
+    return keys[code];
+}
+
 /* ---- Input repeat helper ---- */
 static int ov_repeat(int held, int* timer) {
     if (!held) { *timer = 0; return 0; }
@@ -748,8 +795,13 @@ static void menu_process_input(void) {
     int down  = keys[SDL_SCANCODE_DOWN];
     int left  = keys[SDL_SCANCODE_LEFT];
     int right = keys[SDL_SCANCODE_RIGHT];
-    int tab_l = keys[SDL_SCANCODE_Q] || keys[SDL_SCANCODE_PAGEUP];
-    int tab_r = keys[SDL_SCANCODE_E] || keys[SDL_SCANCODE_PAGEDOWN];
+    /* Tabs: Q/E, PageUp/PageDown, or whatever GC L/R are bound to (A30:
+     * L1/R1 — its only keyboard shoulders that aren't the menu key) */
+    PCKeybindings* kb = &g_pc_keybindings;
+    int tab_l = ov_nav_key(keys, nkeys, SDL_SCANCODE_Q) || ov_nav_key(keys, nkeys, SDL_SCANCODE_PAGEUP) ||
+                (kb->l != SDL_SCANCODE_E && ov_nav_key(keys, nkeys, kb->l));
+    int tab_r = ov_nav_key(keys, nkeys, SDL_SCANCODE_E) || ov_nav_key(keys, nkeys, SDL_SCANCODE_PAGEDOWN) ||
+                (kb->r != SDL_SCANCODE_Q && ov_nav_key(keys, nkeys, kb->r));
     int ctrl_a = 0, ctrl_x = 0;
 
     if (ctrl) {
@@ -806,7 +858,10 @@ static void menu_process_input(void) {
              * Uses a hold timer rather than edge detection to prevent the button
              * just used for capture from immediately clearing the new binding. */
             {
-                int x_or_del = ctrl_x || keys[SDL_SCANCODE_DELETE];
+                /* Delete, gamepad X, or the key bound to GC Z (keyboard-only
+                 * devices like the A30 have neither of the others) */
+                int x_or_del = ctrl_x || keys[SDL_SCANCODE_DELETE] ||
+                               ov_nav_key(keys, nkeys, g_pc_keybindings.z);
                 if (x_or_del) {
                     if (!ctrl_clear_start) {
                         ctrl_clear_start  = SDL_GetTicks();
@@ -978,28 +1033,68 @@ static void draw_menu(float cw, float ch, float pad) {
     if (ctrl_capture_idx >= 0) {
         ov_string("Any key: bind  Back: cancel", tx, ty, cw, ch, 0.5f, 0.8f, 0.5f, 1);
     } else if (s_active_tab == TAB_CONTROLS) {
-        ov_string(">:rebind  X/Del:clear", tx, ty, cw, ch, 0.5f, 0.5f, 0.5f, 1);
+        ov_string(">:bind  hold Z/X/Del:clear", tx, ty, cw, ch, 0.5f, 0.5f, 0.5f, 1);
     } else {
         ov_string("L/R:Tab  U/D:Nav  L/R:Adj", tx, ty, cw, ch, 0.5f, 0.5f, 0.5f, 1);
     }
     ty += row_h;
-    ov_string("Select/Tab:Close+Save", tx, ty, cw, ch, 0.5f, 0.5f, 0.5f, 1);
+    ov_string("Menu key:Close+Save", tx, ty, cw, ch, 0.5f, 0.5f, 0.5f, 1);
+}
+
+/* Whole-panel viewport when frames go through the (possibly rotated)
+ * present pass, else the window. */
+static void ov_viewport(void) {
+    if (pc_gl_present_needed())
+        glViewport(0, 0, g_pc_phys_w, g_pc_phys_h);
+    else
+        glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+}
+
+/* Upload + draw ov_verts. Positions are logical-screen clip coords; on a
+ * rotated panel they're rotated here, matching the present pass. */
+static void ov_flush_verts(void) {
+    if (ov_nv <= 0) return;
+    if (g_pc_rotation) {
+        for (int i = 0; i < ov_nv; i++)
+            pc_gl_rotate_clip(&ov_verts[i].x, &ov_verts[i].y);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, ov_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(ov_nv * sizeof(OvVtx)), ov_verts);
+    if (!g_pc_has_vao) {
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(OvVtx), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(OvVtx), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(OvVtx), (void*)(4 * sizeof(float)));
+        glDisableVertexAttribArray(3);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, ov_nv);
+    pc_gx_rebind_vertex_state();  /* no-VAO: GX's attribs were overwritten */
 }
 
 /* ---- Public API ---- */
 
 void pc_overlay_init(void) {
     /* Save GL state that we'll disturb — pc_gx keeps its VAO/VBO bound at all times */
-    GLint prev_vao, prev_vbo, prev_tex;
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+    GLint prev_vao = 0, prev_vbo, prev_tex;
+    if (g_pc_has_vao) glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_vbo);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
 
-    GLuint vs = ov_compile_shader(GL_VERTEX_SHADER, ov_vert_src);
-    GLuint fs = ov_compile_shader(GL_FRAGMENT_SHADER, ov_frag_src);
+    const char* vsrc = ov_vert_src;
+    const char* fsrc = ov_frag_src;
+#ifdef PC_USE_GLES
+    if (g_pc_gles2) { vsrc = ov_vert_src_es2; fsrc = ov_frag_src_es2; }
+#endif
+    GLuint vs = ov_compile_shader(GL_VERTEX_SHADER, vsrc);
+    GLuint fs = ov_compile_shader(GL_FRAGMENT_SHADER, fsrc);
     ov_prog = glCreateProgram();
     glAttachShader(ov_prog, vs);
     glAttachShader(ov_prog, fs);
+    glBindAttribLocation(ov_prog, 0, "a_pos");
+    glBindAttribLocation(ov_prog, 1, "a_uv");
+    glBindAttribLocation(ov_prog, 2, "a_col");
     glLinkProgram(ov_prog);
     glDeleteShader(vs);
     glDeleteShader(fs);
@@ -1028,8 +1123,14 @@ void pc_overlay_init(void) {
     glGenTextures(1, &ov_tex);
     glBindTexture(GL_TEXTURE_2D, ov_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 48, 0,
-                 GL_RED, GL_UNSIGNED_BYTE, pixels);
+#ifdef PC_USE_GLES
+    if (g_pc_gles2)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 128, 48, 0,
+                     GL_LUMINANCE, GL_UNSIGNED_BYTE, pixels);
+    else
+#endif
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 48, 0,
+                     GL_RED, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1085,7 +1186,8 @@ void pc_overlay_boot_splash(const char* msg) {
 
     SDL_PumpEvents();
 
-    glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ov_viewport();
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -1110,11 +1212,7 @@ void pc_overlay_boot_splash(const char* msg) {
     float y = ((float)g_pc_window_h - ch) * 0.5f;
     ov_string(msg, x, y, cw, ch, 1, 1, 1, 1);
 
-    if (ov_nv > 0) {
-        glBindBuffer(GL_ARRAY_BUFFER, ov_vbo);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(ov_nv * sizeof(OvVtx)), ov_verts);
-        glDrawArrays(GL_TRIANGLES, 0, ov_nv);
-    }
+    ov_flush_verts();
 
     SDL_GL_SwapWindow(g_pc_window);
 }
@@ -1127,7 +1225,8 @@ void pc_overlay_boot_error_frame(const char* const* lines, int n_lines) {
 
     if (!ov_prog || !g_pc_window) return;
 
-    glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ov_viewport();
     glClearColor(0.28f, 0.02f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -1164,11 +1263,7 @@ void pc_overlay_boot_error_frame(const char* const* lines, int n_lines) {
             y += line_h;
         }
 
-        if (ov_nv > 0) {
-            glBindBuffer(GL_ARRAY_BUFFER, ov_vbo);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(ov_nv * sizeof(OvVtx)), ov_verts);
-            glDrawArrays(GL_TRIANGLES, 0, ov_nv);
-        }
+        ov_flush_verts();
     }
 
     SDL_GL_SwapWindow(g_pc_window);
@@ -1179,15 +1274,16 @@ void pc_overlay_draw(void) {
 
     /* Nothing to draw? */
     int want_fps = g_pc_settings.show_fps && !g_pc_menu_open;
-    if (!want_fps && !g_pc_menu_open) return;
+    int want_toast = toast_active();
+    if (!want_fps && !g_pc_menu_open && !want_toast) return;
 
     /* Process menu input */
     if (g_pc_menu_open) menu_process_input();
 
     /* ---- Save GL state ---- */
-    GLint sv_prog, sv_vao, sv_vbo, sv_tex, sv_active_tex, sv_vp[4], sv_bsrc, sv_bdst;
+    GLint sv_prog, sv_vao = 0, sv_vbo, sv_tex, sv_active_tex, sv_vp[4], sv_bsrc, sv_bdst;
     glGetIntegerv(GL_CURRENT_PROGRAM, &sv_prog);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &sv_vao);
+    if (g_pc_has_vao) glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &sv_vao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &sv_vbo);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &sv_active_tex);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &sv_tex);
@@ -1208,7 +1304,7 @@ void pc_overlay_draw(void) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
-    glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+    ov_viewport();
 
     /* ---- Build vertices ---- */
     int scale = g_pc_window_h / 240;
@@ -1225,13 +1321,11 @@ void pc_overlay_draw(void) {
     } else if (want_fps) {
         draw_fps(cw, ch, pad);
     }
+    if (want_toast)
+        draw_toast(cw, ch, pad);
 
     /* ---- Upload & draw ---- */
-    if (ov_nv > 0) {
-        glBindBuffer(GL_ARRAY_BUFFER, ov_vbo);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(ov_nv * sizeof(OvVtx)), ov_verts);
-        glDrawArrays(GL_TRIANGLES, 0, ov_nv);
-    }
+    ov_flush_verts();
 
     /* ---- Restore GL state ---- */
     glUseProgram(sv_prog);

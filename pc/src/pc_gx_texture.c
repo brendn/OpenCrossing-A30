@@ -1,5 +1,6 @@
 /* pc_gx_texture.c - GC texture format decoders + 2048-entry texture cache */
 #include "pc_gx_internal.h"
+#include "pc_gl_compat.h"
 #include "pc_texture_pack.h"
 #include <dolphin/gx/GXEnum.h>
 #include <stdlib.h>
@@ -91,6 +92,157 @@ static u32 tlut_content_hash(const void* data, int tlut_fmt, int n_entries, int 
     h ^= (u32)(n_entries & 0xFFFF); h *= 0x01000193u;
     h ^= (u32)(is_be & 1); h *= 0x01000193u;
     return h;
+}
+
+/* GX wrap mode → GL. GLES2 without OES_texture_npot only allows
+ * CLAMP_TO_EDGE on non-power-of-two textures (anything else samples black). */
+static GLenum gx_gl_wrap(u32 mode, int size) {
+    if (mode != 0 && !g_pc_has_npot && (size & (size - 1)) != 0)
+        return GL_CLAMP_TO_EDGE;
+    return (mode == 2) ? GL_MIRRORED_REPEAT :
+           (mode == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+}
+
+/* --- Compact texture upload (GLES2 / Miyoo A30, 2026-10-07) ---
+ * Decoders always emit RGBA8. Most GX textures are really 16-bit or
+ * 8-bit (I4/I8/IA4/IA8/RGB565/RGB5A3/palettes), so uploading RGBA8
+ * doubles or quadruples texture memory and sampling bandwidth — the
+ * Mali-400's weak spot (512 MB shared RAM). Repack into the smallest GL
+ * format that represents EVERY texel exactly: the decoded byte must be
+ * one the decoders' own n-bit expansion (v*255/(2^n-1), truncating) can
+ * produce, and the packed value is that v — so the GPU samples v/(2^n-1),
+ * within 1/255 of the RGBA8 upload (and closer to GC hardware). Anything
+ * else (RGBA8, most CMPR) stays RGBA8. Content-based, so decoders stay byte-identical.
+ * Default on for GLES2 only; PC_TEX16=0/1 overrides (GLES builds). */
+enum { TEX16_L, TEX16_LA, TEX16_565, TEX16_5551, TEX16_4444, TEX16_RGBA8, TEX16_N };
+static int    s_tex16 = -1;
+static u32    s_tex16_count[TEX16_N];
+static u64    s_tex16_bytes_in, s_tex16_bytes_out;
+
+/* inverse of the decoders' channel expansion; -1 = not producible */
+static s8 s_inv5[256], s_inv6[256], s_inv4[256];
+
+static int gx_tex16_enabled(void) {
+    if (s_tex16 < 0) {
+        memset(s_inv5, -1, sizeof(s_inv5));
+        memset(s_inv6, -1, sizeof(s_inv6));
+        memset(s_inv4, -1, sizeof(s_inv4));
+        for (int v = 0; v < 32; v++) s_inv5[v * 255 / 31] = (s8)v;
+        for (int v = 0; v < 64; v++) s_inv6[v * 255 / 63] = (s8)v;
+        for (int v = 0; v < 16; v++) s_inv4[v * 255 / 15] = (s8)v;
+#ifdef PC_USE_GLES
+        const char* e = getenv("PC_TEX16");
+        s_tex16 = e ? (atoi(e) != 0) : g_pc_gles2;
+#else
+        s_tex16 = 0;  /* desktop core GL has no LUMINANCE formats */
+#endif
+        printf("[PC/TEX] compact texture upload %s\n", s_tex16 ? "on" : "off");
+    }
+    return s_tex16;
+}
+
+static void gx_upload_rgba(int w, int h, const u8* rgba) {
+    const int n = w * h;
+    int kind = TEX16_RGBA8;
+
+    if (gx_tex16_enabled()) {
+        int gray = 1, opaque = 1, a_bin = 1, c565 = 1, c555 = 1, c444 = 1;
+        for (int i = 0; i < n; i++) {
+            const u8* p = rgba + i * 4;
+            u8 r = p[0], g = p[1], b = p[2], a = p[3];
+            if (r != g || g != b) gray = 0;
+            if (a != 255) { opaque = 0; if (a != 0) a_bin = 0; }
+            if (c555 || c565) {
+                if (s_inv5[r] < 0 || s_inv5[b] < 0) { c565 = 0; c555 = 0; }
+                else {
+                    if (s_inv6[g] < 0) c565 = 0;
+                    if (s_inv5[g] < 0) c555 = 0;
+                }
+            }
+            if (c444 && (s_inv4[r] < 0 || s_inv4[g] < 0 || s_inv4[b] < 0 || s_inv4[a] < 0))
+                c444 = 0;
+            if (!gray && !c565 && !c555 && !c444) break;
+        }
+        if (gray && opaque)         kind = TEX16_L;
+        else if (gray)              kind = TEX16_LA;
+        else if (opaque && c565)    kind = TEX16_565;
+        else if (a_bin && c555)     kind = TEX16_5551;
+        else if (c444)              kind = TEX16_4444;
+    }
+
+    void* packed = NULL;
+    if (kind != TEX16_RGBA8) {
+        packed = malloc((size_t)n * (kind == TEX16_L ? 1 : 2));
+        if (!packed) kind = TEX16_RGBA8;
+    }
+
+    GLint prev_align = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    switch (kind) {
+#ifdef PC_USE_GLES
+    case TEX16_L: {
+        u8* d = (u8*)packed;
+        for (int i = 0; i < n; i++) d[i] = rgba[i * 4];
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, d);
+        break;
+    }
+    case TEX16_LA: {
+        u8* d = (u8*)packed;
+        for (int i = 0; i < n; i++) { d[i * 2] = rgba[i * 4]; d[i * 2 + 1] = rgba[i * 4 + 3]; }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, w, h, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, d);
+        break;
+    }
+#endif
+    case TEX16_565: {
+        u16* d = (u16*)packed;
+        for (int i = 0; i < n; i++) {
+            const u8* p = rgba + i * 4;
+            d[i] = (u16)((s_inv5[p[0]] << 11) | (s_inv6[p[1]] << 5) | s_inv5[p[2]]);
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, d);
+        break;
+    }
+    case TEX16_5551: {
+        u16* d = (u16*)packed;
+        for (int i = 0; i < n; i++) {
+            const u8* p = rgba + i * 4;
+            d[i] = (u16)((s_inv5[p[0]] << 11) | (s_inv5[p[1]] << 6) | (s_inv5[p[2]] << 1) | (p[3] >> 7));
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, d);
+        break;
+    }
+    case TEX16_4444: {
+        u16* d = (u16*)packed;
+        for (int i = 0; i < n; i++) {
+            const u8* p = rgba + i * 4;
+            d[i] = (u16)((s_inv4[p[0]] << 12) | (s_inv4[p[1]] << 8) | (s_inv4[p[2]] << 4) | s_inv4[p[3]]);
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, d);
+        break;
+    }
+    default:
+        kind = TEX16_RGBA8;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        break;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+    free(packed);
+
+    if (s_tex16) {
+        static const int bpp[TEX16_N] = { 1, 2, 2, 2, 2, 4 };
+        s_tex16_count[kind]++;
+        s_tex16_bytes_in += (u64)n * 4;
+        s_tex16_bytes_out += (u64)n * bpp[kind];
+        u32 total = 0;
+        for (int k = 0; k < TEX16_N; k++) total += s_tex16_count[k];
+        /* log at 16/32/64/128, then every 256 uploads */
+        if (g_pc_verbose && (total & 255) == 0 || (g_pc_verbose && total >= 16 && total < 256 && (total & (total - 1)) == 0))
+            printf("[PC/TEX] compact upload: %u tex (L %u LA %u 565 %u 5551 %u 4444 %u RGBA8 %u), %.1f MB -> %.1f MB\n",
+                   total, s_tex16_count[TEX16_L], s_tex16_count[TEX16_LA], s_tex16_count[TEX16_565],
+                   s_tex16_count[TEX16_5551], s_tex16_count[TEX16_4444], s_tex16_count[TEX16_RGBA8],
+                   (double)s_tex16_bytes_in / 1048576.0, (double)s_tex16_bytes_out / 1048576.0);
+    }
 }
 
 static TexCacheEntry tex_cache[TEX_CACHE_SIZE];
@@ -956,10 +1108,8 @@ void GXLoadTexObj(void* obj, u32 id) {
 
         /* update wrap/filter if changed */
         if (cached->wrap_s != wrap_s || cached->wrap_t != wrap_t) {
-            GLenum gl_ws = (wrap_s == 2) ? GL_MIRRORED_REPEAT :
-                           (wrap_s == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-            GLenum gl_wt = (wrap_t == 2) ? GL_MIRRORED_REPEAT :
-                           (wrap_t == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+            GLenum gl_ws = gx_gl_wrap(wrap_s, width);
+            GLenum gl_wt = gx_gl_wrap(wrap_t, height);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gl_ws);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gl_wt);
             cached->wrap_s = wrap_s;
@@ -1006,10 +1156,8 @@ void GXLoadTexObj(void* obj, u32 id) {
                                                &hd_w, &hd_h);
         if (hd_tex) {
             glBindTexture(GL_TEXTURE_2D, hd_tex);
-            GLenum gl_ws = (wrap_s == 2) ? GL_MIRRORED_REPEAT :
-                           (wrap_s == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-            GLenum gl_wt = (wrap_t == 2) ? GL_MIRRORED_REPEAT :
-                           (wrap_t == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+            GLenum gl_ws = gx_gl_wrap(wrap_s, hd_w);
+            GLenum gl_wt = gx_gl_wrap(wrap_t, hd_h);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gl_ws);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gl_wt);
 
@@ -1090,8 +1238,7 @@ void GXLoadTexObj(void* obj, u32 id) {
             }
 
             decode_gc_texture(image_ptr, rgba, width, height, format, palette);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            gx_upload_rgba(width, height, rgba);
             PC_GL_CHECK("glTexImage2D");
             free(rgba);
         } else {
@@ -1110,10 +1257,8 @@ void GXLoadTexObj(void* obj, u32 id) {
     }
 
     {
-        GLenum gl_ws = (wrap_s == 2) ? GL_MIRRORED_REPEAT :
-                       (wrap_s == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-        GLenum gl_wt = (wrap_t == 2) ? GL_MIRRORED_REPEAT :
-                       (wrap_t == 0) ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+        GLenum gl_ws = gx_gl_wrap(wrap_s, width);
+        GLenum gl_wt = gx_gl_wrap(wrap_t, height);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gl_ws);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gl_wt);
     }

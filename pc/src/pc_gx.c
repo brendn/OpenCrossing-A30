@@ -1,5 +1,6 @@
 /* pc_gx.c - GX API → OpenGL 3.3: state management, vertex submission, draw dispatch */
 #include "pc_gx_internal.h"
+#include "pc_gl_compat.h"
 #include <stddef.h>
 static GLushort quad_index_buf[(PC_GX_MAX_VERTS / 4) * 6];
 #include <math.h>
@@ -61,6 +62,12 @@ static GLuint s_render_tex = 0;
 static GLuint s_render_rbo = 0;
 static int    s_fbo_w = 0;
 static int    s_fbo_h = 0;
+static int    s_fbo_active = 0;  /* this frame renders into s_render_fbo */
+
+/* Framebuffer the game is drawing into this frame. */
+static GLuint pc_gx_game_fbo(void) {
+    return s_fbo_active ? s_render_fbo : 0;
+}
 
 static void pc_gx_ensure_render_fbo(int w, int h) {
     if (s_render_fbo && s_fbo_w == w && s_fbo_h == h) return;
@@ -73,7 +80,9 @@ static void pc_gx_ensure_render_fbo(int w, int h) {
     glBindFramebuffer(GL_FRAMEBUFFER, s_render_fbo);
     glGenTextures(1, &s_render_tex);
     glBindTexture(GL_TEXTURE_2D, s_render_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    /* GLES2 has no sized RGBA8 internal format */
+    glTexImage2D(GL_TEXTURE_2D, 0, g_pc_gles2 ? GL_RGBA : GL_RGBA8, w, h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -81,13 +90,25 @@ static void pc_gx_ensure_render_fbo(int w, int h) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_render_tex, 0);
     glGenRenderbuffers(1, &s_render_rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, s_render_rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s_render_rbo);
+#ifdef PC_USE_GLES
+    if (g_pc_gles2) {
+        /* No stencil use anywhere; GLES2 core only guarantees 16-bit depth. */
+        GLenum dfmt = GLAD_GL_OES_depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16;
+        glRenderbufferStorage(GL_RENDERBUFFER, dfmt, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, s_render_rbo);
+    } else
+#endif
+    {
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s_render_rbo);
+    }
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
     s_fbo_w = w;
     s_fbo_h = h;
-    fprintf(stderr, "[GX] Render FBO: %dx%d\n", w, h);
+    fprintf(stderr, "[GX] Render FBO: %dx%d%s\n", w, h,
+            status == GL_FRAMEBUFFER_COMPLETE ? "" : " (INCOMPLETE!)");
 }
 
 void pc_gx_efb_capture_store(u32 dest_ptr, GLuint gl_tex) {
@@ -352,6 +373,12 @@ void pc_gx_init(void) {
     pc_gx_state_dedup = (getenv("PC_NO_STATE_DEDUP") == NULL);
     pc_gx_uniform_shadow = (getenv("PC_NO_UNIFORM_SHADOW") == NULL);
     s_stream_vbo = (getenv("PC_NO_STREAM_VBO") == NULL);
+    /* GLES2 (Mali-400): no MapBufferRange/BaseVertex, and SubData into an
+     * in-flight 6MB buffer risks driver copies — the per-flush orphan path
+     * is the classic GLES2 pattern and ran 60fps on the A30. Opt in with
+     * PC_STREAM_VBO=1. */
+    if (g_pc_gles2 && getenv("PC_STREAM_VBO") == NULL)
+        s_stream_vbo = 0;
     s_stream_subdata = (getenv("PC_STREAM_SUBDATA") != NULL);
     s_strip_convert = (getenv("PC_NO_STRIP_CONVERT") == NULL);
     s_batch_cull = (getenv("PC_NO_BATCH_CULL") == NULL);
@@ -453,6 +480,40 @@ void pc_gx_init(void) {
     pc_gx_dirty_all();
 }
 
+/* GX matrices are row-major. Transpose on the CPU and upload with
+ * transpose=GL_FALSE: GLES 2.0 rejects GL_TRUE with GL_INVALID_VALUE (the
+ * matrix never arrives — Miyoo A30 black screen, 2026-10-07). Done on every
+ * GL flavour so the smoke harness exercises the same path. */
+static void upload_mat4_rowmajor(GLint loc, const float* m) {
+    float t[16];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            t[c * 4 + r] = m[r * 4 + c];
+    glUniformMatrix4fv(loc, 1, GL_FALSE, t);
+}
+
+static void upload_mat3_rowmajor(GLint loc, const float* m) {
+    float t[9];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            t[c * 3 + r] = m[r * 3 + c];
+    glUniformMatrix3fv(loc, 1, GL_FALSE, t);
+}
+
+void pc_gx_rebind_vertex_state(void) {
+    if (!g_gx.vbo) return;  /* before pc_gx_init */
+    glBindVertexArray(g_gx.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gx.vbo);
+    if (!g_pc_has_vao) {
+        /* No VAOs: attrib state is global and another component (overlay,
+         * present quad) has replaced it — re-specify GX's layout. */
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gx.ebo);
+        for (GLuint a = 0; a < 4; a++)
+            glEnableVertexAttribArray(a);
+        pc_gx_set_attrib_base(s_attrib_base > 0 ? s_attrib_base : 0);
+    }
+}
+
 /* Last GL viewport/scissor actually applied. GXSetViewport/GXSetScissor skip
  * flush + GL entirely when re-set with identical values; anything that touches
  * GL viewport/scissor outside those setters must invalidate these shadows. */
@@ -501,13 +562,18 @@ void pc_gx_begin_frame(void) {
     pc_gx_update_aspect();
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, g_pc_render_w, g_pc_render_h);
-    /* Bind render FBO when game renders at sub-window resolution */
-    if (g_pc_render_w < g_pc_window_w || g_pc_render_h < g_pc_window_h) {
+    /* Bind render FBO when game renders at sub-window resolution, or when
+     * the frame needs a present pass (rotated panel / GLES2 — see
+     * pc_gl_present_needed) */
+    if (g_pc_render_w < g_pc_window_w || g_pc_render_h < g_pc_window_h ||
+        pc_gl_present_needed()) {
         pc_gx_ensure_render_fbo(g_pc_render_w, g_pc_render_h);
         glBindFramebuffer(GL_FRAMEBUFFER, s_render_fbo);
+        s_fbo_active = 1;
     } else {
-        /* Full-res: render directly to default framebuffer, release any old FBO */
+        /* Full-res: render directly to default framebuffer */
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        s_fbo_active = 0;
     }
 #endif
 #ifdef PC_USE_GLES
@@ -522,9 +588,7 @@ void pc_gx_begin_frame(void) {
 void pc_gx_restore_after_nes(void) {
     /* NES emulator uses its own shader/VAO/state. Rebind the game's GL objects
      * and mark all GX state dirty so uniforms/textures get re-uploaded. */
-    glBindVertexArray(g_gx.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_gx.vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gx.ebo);
+    pc_gx_rebind_vertex_state();
     pc_gx_dirty_all();
     g_gx.current_shader = 0; /* Force shader rebind on next draw */
     pc_gx_invalidate_vp_shadow();
@@ -552,7 +616,49 @@ void pc_gx_shutdown(void) {
 
 void pc_gx_blit_to_screen(void) {
 #ifdef PC_ENHANCEMENTS
-    if (!s_render_fbo) return;  /* rendering directly to default FB, nothing to do */
+    if (!s_fbo_active) return;  /* rendering directly to default FB, nothing to do */
+
+#ifdef PC_USE_GLES
+    /* The frame's depth is dead now. Telling the (tile-based) Mali driver
+     * lets it skip writing the depth tiles back to RAM — pure bandwidth on
+     * Mali-400 / Mali-G31. Next frame clears depth anyway. */
+    glBindFramebuffer(GL_FRAMEBUFFER, s_render_fbo);
+    if (g_pc_gles2) {
+        static const GLenum att_es2[1] = { GL_DEPTH_ATTACHMENT };
+        if (GLAD_GL_EXT_discard_framebuffer && glDiscardFramebufferEXT)
+            glDiscardFramebufferEXT(GL_FRAMEBUFFER, 1, att_es2);
+    } else if (glInvalidateFramebuffer) {
+        static const GLenum att_es3[1] = { GL_DEPTH_STENCIL_ATTACHMENT };
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, att_es3);
+    }
+#endif
+
+    /* Present pass: textured quad, which can rotate (portrait panels) and
+     * works without glBlitFramebuffer (GLES2). Leaves the default FB bound
+     * with a whole-panel viewport for the overlay. */
+    if (pc_gl_present_needed() || !glBlitFramebuffer) {
+        pc_gl_bind_screen();
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        float dw = (float)g_pc_window_w, dh = (float)g_pc_window_h;
+        float dx = 0.0f, dy = 0.0f;
+        if (g_pc_scale_mode == 1) {
+            dw = (float)s_fbo_w;
+            dh = (float)s_fbo_h;
+            dx = ((float)g_pc_window_w - dw) * 0.5f;
+            dy = ((float)g_pc_window_h - dh) * 0.5f;
+            if (dx < 0.0f) dx = 0.0f;
+            if (dy < 0.0f) dy = 0.0f;
+        }
+        pc_gl_draw_tex_quad(s_render_tex, dx, dy, dw, dh,
+                            (float)g_pc_window_w, (float)g_pc_window_h,
+                            0.0f, 0.0f, 1.0f, 1.0f, 1);
+        /* viewport/scissor changed outside the GX setters */
+        pc_gx_invalidate_vp_shadow();
+        return;
+    }
 
     /* Bind default framebuffer as draw target */
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -1075,7 +1181,7 @@ void pc_gx_flush_vertices(void) {
 
         if (dirty & PC_GX_DIRTY_PROJECTION) {
             loc = UL(projection);
-            if (loc >= 0) glUniformMatrix4fv(loc, 1, GL_TRUE, (float*)g_gx.projection_mtx);
+            if (loc >= 0) upload_mat4_rowmajor(loc, (const float*)g_gx.projection_mtx);
         }
 
         if (dirty & PC_GX_DIRTY_MODELVIEW) {
@@ -1087,10 +1193,10 @@ void pc_gx_flush_vertices(void) {
                 mv44[ 4] = src[4]; mv44[ 5] = src[5]; mv44[ 6] = src[6]; mv44[ 7] = src[7];
                 mv44[ 8] = src[8]; mv44[ 9] = src[9]; mv44[10] = src[10]; mv44[11] = src[11];
                 mv44[12] = 0.0f;   mv44[13] = 0.0f;   mv44[14] = 0.0f;    mv44[15] = 1.0f;
-                glUniformMatrix4fv(loc, 1, GL_TRUE, mv44);
+                upload_mat4_rowmajor(loc, mv44);
             }
             loc = UL(normal_mtx);
-            if (loc >= 0) glUniformMatrix3fv(loc, 1, GL_TRUE, (const float*)g_gx.nrm_mtx[g_gx.current_mtx]);
+            if (loc >= 0) upload_mat3_rowmajor(loc, (const float*)g_gx.nrm_mtx[g_gx.current_mtx]);
         }
 
         if (dirty & PC_GX_DIRTY_TEV_COLORS) {
@@ -2366,21 +2472,42 @@ static void pc_gx_copy_tex_execute(void* dest, GXBool clear) {
         if (!s_efb_copy_fbo)
             glGenFramebuffers(1, &s_efb_copy_fbo);
 
-        /* Attach destination texture to FBO, blit with Y-flip */
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_efb_copy_fbo);
-        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, efb_tex, 0);
+        if (!glBlitFramebuffer && s_fbo_active) {
+            /* GLES2: no blit. The game renders into s_render_tex here (GLES2
+             * always presents), so draw the region into the capture texture
+             * as a quad, flipped by swapping the source v range. */
+            GLint vp[4];
+            glGetIntegerv(GL_VIEWPORT, vp);
+            glBindFramebuffer(GL_FRAMEBUFFER, s_efb_copy_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, efb_tex, 0);
+            glViewport(0, 0, read_wd, read_ht);
+            float fw = (float)s_fbo_w, fh = (float)s_fbo_h;
+            pc_gl_draw_tex_quad(s_render_tex, 0.0f, 0.0f, (float)read_wd, (float)read_ht,
+                                (float)read_wd, (float)read_ht,
+                                (float)read_left / fw, (float)(gl_y + read_ht) / fh,
+                                (float)(read_left + read_wd) / fw, (float)gl_y / fh, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, s_render_fbo);
+            glViewport(vp[0], vp[1], vp[2], vp[3]);
+        } else if (glBlitFramebuffer) {
+            /* Attach destination texture to FBO, blit with Y-flip */
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_efb_copy_fbo);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, efb_tex, 0);
 
-        /* Source: default framebuffer region (bottom-up GL coords).
-         * Dest: texture via FBO, with Y flipped (src bottom→dst top) so the
-         * texture ends up in top-down order matching GC convention. */
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-        glBlitFramebuffer(
-            read_left, gl_y, read_left + read_wd, gl_y + read_ht,  /* src: GL bottom-up */
-            0, read_ht, read_wd, 0,                                 /* dst: flipped Y */
-            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            /* Source: the game's current target region (bottom-up GL coords).
+             * Dest: texture via FBO, with Y flipped (src bottom→dst top) so the
+             * texture ends up in top-down order matching GC convention. */
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, pc_gx_game_fbo());
+            glBlitFramebuffer(
+                read_left, gl_y, read_left + read_wd, gl_y + read_ht,  /* src: GL bottom-up */
+                0, read_ht, read_wd, 0,                                 /* dst: flipped Y */
+                GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+            /* Back to drawing into the game's target (the render FBO when
+             * render scale / present is active, not the window). */
+            glBindFramebuffer(GL_FRAMEBUFFER, pc_gx_game_fbo());
+        }
 
         pc_gx_efb_capture_store((u32)(uintptr_t)dest, efb_tex);
         glBindTexture(GL_TEXTURE_2D, 0);

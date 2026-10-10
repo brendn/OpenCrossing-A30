@@ -50,8 +50,23 @@ static int    l1_was_held = 0;
 static Uint32 kb_l_last_release = 0;
 static int    kb_l_was_held = 0;
 
+/* PC_NO_CONTROLLER=1: keyboard only. The Miyoo A30 reports every button
+ * twice — as a keyboard key AND through spruce's virtual "Xbox 360"
+ * pad with a different layout — so with both open each press hits two GC
+ * buttons (in-game keyboard: d-pad right also typed a space, A acted
+ * like B). */
+static int pad_controllers_disabled(void) {
+    static int s_disabled = -1;
+    if (s_disabled < 0) {
+        const char* e = getenv("PC_NO_CONTROLLER");
+        s_disabled = (e && atoi(e) != 0);
+        if (s_disabled) printf("[PC] PC_NO_CONTROLLER: game controllers ignored (keyboard only)\n");
+    }
+    return s_disabled;
+}
+
 BOOL PADInit(void) {
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+    for (int i = 0; i < SDL_NumJoysticks() && !pad_controllers_disabled(); i++) {
         if (SDL_IsGameController(i)) {
             g_controller = SDL_GameControllerOpen(i);
             if (g_controller) {
@@ -142,7 +157,7 @@ u32 PADRead(PADStatus* status) {
     }
 
     /* hotplug */
-    if (!g_controller) {
+    if (!g_controller && !pad_controllers_disabled()) {
         for (int i = 0; i < SDL_NumJoysticks(); i++) {
             if (SDL_IsGameController(i)) {
                 g_controller = SDL_GameControllerOpen(i);
