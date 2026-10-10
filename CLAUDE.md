@@ -22,10 +22,12 @@ are deliberately stable — renaming them would break existing installs.
   UB-guard flags), 32-bit pointer assumptions everywhere. Platform code lives
   in `pc/`.
 - After any renderer/texture/shader change: build armhf in Docker and run
-  `./harness/smoke.sh armhf` (twice, to also exercise the shader disk cache).
-- Launcher sync: `port_files/Animal Crossing.sh` is source of truth;
-  keep `portmaster/Animal Crossing.sh` (release zip copy) in sync. The A30
-  launcher `a30/Animal Crossing.sh` is separate (not covered by that rule).
+  `./harness/smoke.sh armhf` (twice, to also exercise the shader disk cache),
+  plus the GLES2 runs in kb/build-test.md (`PC_GLES2=1`). The A30 binary
+  can't run in the Mesa container — the armhf build is the GLES2 test bed.
+- Anbernic packaging (`portmaster/`, `port_files/`, `release.sh`) was removed
+  from this fork; the A30 launcher is `a30/Animal Crossing.sh`. Shared `pc/`
+  code still supports the H700/GLES3 path — don't strip it (upstream merges).
 - A30 packaging: `a30/make-package.sh` builds the zip in a temp dir; never
   commit `a30/Roms/` or `a30/*.zip` (gitignored).
 

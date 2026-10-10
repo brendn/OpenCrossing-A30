@@ -108,7 +108,10 @@
   (parent TechProGabe/OpenCrossing-Anbernic). Device-verified ~60 fps at
   100% render scale; launcher first-run default kept at 75% to save
   battery (user decision). Binding fixes confirmed on device. README
-  rewritten for the A30 fork.
+  rewritten for the A30 fork. CI switched to A30-only. Anbernic
+  packaging removed (`portmaster/` incl. pm-submission, `port_files/`,
+  `release.sh`, `harness/check-launcher-sync.sh`); shared `pc/` code and
+  the armhf Docker build kept (GLES2 test bed, upstream merges).
 
 ## Standing decisions
 

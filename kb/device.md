@@ -76,8 +76,7 @@ notes below are still pre-device research; trust device logs over them.
   `-USR1` = analog. Launcher uses d-pad mode (game sees no SDL
   controller) and writes an A30 keybindings.ini on first run. Menu
   (Escape) quits the game without a save prompt.
-- Launcher: `a30/Animal Crossing.sh` (not a PortMaster launcher; the
-  check-launcher-sync rule doesn't cover it). Sets `PC_GLES2=1`, first-run
+- Launcher: `a30/Animal Crossing.sh` (the only launcher in this fork). Sets `PC_GLES2=1`, first-run
   settings: render_scale 75, fps dynamic, show_fps 1, verbose 1, LowSpec
   frustum_cull 1 / shadow_quality 1 / particle_quality 2.
 - Rotation is auto (fullscreen + portrait drawable → 90° CCW, matching
@@ -130,9 +129,8 @@ notes below are still pre-device research; trust device logs over them.
   `rom/` (user's GAFE01 iso), `shaders/` (default.vert/frag), `conf/`.
   Game writes here: `log.txt`, `settings.ini`, `keybindings.ini`, `save/`,
   `shader_cache.bin`.
-- `ROMS/Ports/Animal Crossing.sh` — PortMaster launcher. **Source of truth is
-  `port_files/Animal Crossing.sh` in the repo**; `portmaster/Animal Crossing.sh`
-  (used for release zips) must be kept in sync with it.
+- `ROMS/Ports/Animal Crossing.sh` — PortMaster launcher (upstream's
+  `port_files/` / `portmaster/`; removed from this fork 2026-10-10).
 
 ## Deploying a new build
 

@@ -70,9 +70,6 @@ accepts it, specialized shaders unaffected.
 - `./harness/run-native.sh` — macOS native build, fastest iteration loop.
 - Rom: `harness/rom/Animal Crossing.iso` (GAFE01 USA, 1459978240 bytes).
   Git-ignored. **Never commit anything under harness/rom/.**
-- `./harness/check-launcher-sync.sh` — normalized diff of the three launcher
-  .sh copies (GAMEDIR/PORT_32BIT lines intentionally differ). Run before
-  every release package.
 - `./harness/inspect-gci.py <gci>` — save forensics (equipment/pockets dump).
 - Verifying the shader disk cache end-to-end: run smoke twice; second run's
   log must show `[PC/TEV] Preloaded N shader(s) from disk cache`
@@ -123,9 +120,7 @@ dispatch → artifact instead of release) to conserve Actions minutes.
 `AnimalCrossing-ac-gc-a30-<tag>.zip` (`Roms/A30PORTS/...` layout).
 `pc/build-a30-tools/` (CMake + SDL2 built from source) is kept with
 actions/cache — bump the cache key when CMAKE_VER/SDL_VER change. The H700
-PortMaster build (`build-armhf-docker.sh`, `portmaster/make-package.sh`)
-still works locally but is no longer built in CI.
+armhf build (`build-armhf-docker.sh`) is kept as the Docker/Mesa test bed;
+its PortMaster packaging (`portmaster/`, `port_files/`) was removed from
+the fork 2026-10-10.
 Release flow: merge dev→main, tag `vX.Y.Z` on main, push tag. Never tag dev.
-Launcher sync rule: `port_files/Animal Crossing.sh` is source of truth;
-`portmaster/Animal Crossing.sh` ships in the zip — keep in sync (a stale copy
-once nearly shipped without the PipeWire audio fix).

@@ -51,7 +51,6 @@ include/PR/
 include/gcc/
 include/compiler/gcc/stdlib.h
 pc/lib/SDL*
-portmaster/*.zip
 a30/*.zip
 a30/Roms/
 

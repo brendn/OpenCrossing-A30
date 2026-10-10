@@ -6,7 +6,7 @@ Three tiers, fastest feedback first:
 |------|------|-------|----------|
 | 1 | Native macOS build (`pc/build/bin/AnimalCrossing`) | full speed | 64-bit, desktop GL — gameplay/logic checks |
 | 2 | Linux arm64 + GLES 3.2 in Docker (native arch via colima) | near-native | same GL stack class as device (GLES3), 64-bit |
-| 3 | Linux armhf (32-bit ARM) in Docker via QEMU | slow | exact device ABI (muOS PortMaster is armhf) |
+| 3 | Linux armhf (32-bit ARM) in Docker via QEMU | slow | same ABI as the A30 (armhf); with `PC_GLES2=1` exercises the A30 GLES2 path |
 
 A GameCube disc image (GAFE01 USA, `.iso`/`.gcm`/`.ciso`) must be placed in `harness/rom/`
 (git-ignored). It is mounted read-only into containers; never committed.
@@ -17,9 +17,6 @@ A GameCube disc image (GAFE01 USA, `.iso`/`.gcm`/`.ciso`) must be placed in `har
 - `run-gles-arm64.sh` — interactive tier-2 run under XQuartz (needs `xhost +localhost`, XQuartz "Allow connections from network clients").
 - `smoke.sh [arm64|armhf]` — headless boot check in Docker: launches the game under Xvfb,
   waits for frames, dumps `harness/out/<arch>-smoke.log`. Exit 0 = booted past disc load.
-- `check-launcher-sync.sh` — verifies the three hand-maintained launcher `.sh`
-  copies haven't drifted (ignores the intentional GAMEDIR/PORT_32BIT
-  differences). Run before packaging a release.
 - `inspect-gci.py <file.gci>` — dumps equipment + pockets from a save for
   forensics (see kb/issues.md shovel-dupe entry for the layout).
 

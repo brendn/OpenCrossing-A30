@@ -26,7 +26,7 @@ trap 'rm -rf "$STAGE"' EXIT
 PORT="$STAGE/Roms/A30PORTS/ac-gc"
 mkdir -p "$PORT/shaders" "$PORT/rom"
 cp "$REPO/pc/shaders/"* "$PORT/shaders/"
-cp "$REPO/portmaster/ac-gc/rom/README.txt" "$PORT/rom/README.txt"
+cp "$HERE/rom-README.txt" "$PORT/rom/README.txt"
 cp "$BIN" "$PORT/AnimalCrossing"
 chmod +x "$PORT/AnimalCrossing"
 cp "$HERE/Animal Crossing.sh" "$STAGE/Roms/A30PORTS/Animal Crossing.sh"
