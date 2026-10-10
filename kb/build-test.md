@@ -117,10 +117,14 @@ invalidates both local caches and the seed format together.
 ## CI / releases
 
 `.github/workflows/release.yml`: triggers ONLY on `v*` tags (+ manual
-dispatch → artifact instead of release) to conserve private-repo Actions
-minutes. QEMU + same docker script, ~1-3h. Packages via
-`portmaster/make-package.sh` → zip with `Animal Crossing.sh` at root +
-`ports/ac-gc/{AnimalCrossing,shaders/,rom/README.txt,libs.armhf/README.txt}`.
+dispatch → artifact instead of release) to conserve Actions minutes.
+**Builds the Miyoo A30 package only** (fork decision 2026-10-10): QEMU +
+`ubuntu:16.04` + `pc/build-a30-docker.sh`, then `a30/make-package.sh` →
+`AnimalCrossing-ac-gc-a30-<tag>.zip` (`Roms/A30PORTS/...` layout).
+`pc/build-a30-tools/` (CMake + SDL2 built from source) is kept with
+actions/cache — bump the cache key when CMAKE_VER/SDL_VER change. The H700
+PortMaster build (`build-armhf-docker.sh`, `portmaster/make-package.sh`)
+still works locally but is no longer built in CI.
 Release flow: merge dev→main, tag `vX.Y.Z` on main, push tag. Never tag dev.
 Launcher sync rule: `port_files/Animal Crossing.sh` is source of truth;
 `portmaster/Animal Crossing.sh` ships in the zip — keep in sync (a stale copy

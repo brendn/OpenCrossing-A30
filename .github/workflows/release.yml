@@ -1,7 +1,7 @@
 name: Release
 
-# Frugal with Actions minutes (private repo): runs only on version tags
-# or when started by hand.
+# Frugal with Actions minutes: runs only on version tags or when started
+# by hand.
 on:
   push:
     tags: ["v*"]
@@ -23,18 +23,26 @@ jobs:
         with:
           platforms: arm
 
-      - name: Build armhf binary (Debian bookworm, linux/arm/v7)
+      # CMake + SDL2 are built from source under QEMU on first run; keep them
+      # between runs. Bump the key if the versions in build-a30-docker.sh change.
+      - name: Cache A30 build tools
+        uses: actions/cache@v4
+        with:
+          path: pc/build-a30-tools
+          key: a30-tools-cmake3.16.9-sdl2.26.5-v1
+
+      - name: Build A30 binary (Ubuntu 16.04 / glibc 2.23, linux/arm/v7)
         run: |
           docker run --rm --platform linux/arm/v7 \
             -v "$PWD":/work \
-            debian:bookworm bash /work/pc/build-armhf-docker.sh
-          test -f pc/build-armhf/bin/AnimalCrossing
-          file pc/build-armhf/bin/AnimalCrossing | grep -q 'ELF 32-bit.*ARM'
+            ubuntu:16.04 bash /work/pc/build-a30-docker.sh
+          test -f pc/build-a30/bin/AnimalCrossing
+          file pc/build-a30/bin/AnimalCrossing | grep -q 'ELF 32-bit.*ARM'
 
-      - name: Package PortMaster zip
+      - name: Package A30 zip
         run: |
-          ZIP="opencrossing-anbernic-${GITHUB_REF_NAME}-armhf.zip"
-          ./portmaster/make-package.sh pc/build-armhf/bin/AnimalCrossing "$PWD/$ZIP"
+          ZIP="AnimalCrossing-ac-gc-a30-${GITHUB_REF_NAME}.zip"
+          ./a30/make-package.sh pc/build-a30/bin/AnimalCrossing "$PWD/$ZIP"
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
       - name: Upload artifact (manual runs without a tag)
