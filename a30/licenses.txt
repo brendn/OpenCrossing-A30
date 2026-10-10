@@ -1,0 +1,13 @@
+OpenCrossing-A30 — https://github.com/brendn/OpenCrossing-A30
+
+LICENSE.txt (next to this file) covers this port: decompiled game code is
+CC0 1.0 (ACreTeam/ac-decomp), the PC port layer is MIT.
+
+Third-party components:
+- glad GL loader (generated code: WTFPL OR CC0-1.0, Khronos API
+  definitions: Apache-2.0) — https://github.com/Dav1dde/glad
+- Khronos khrplatform.h (MIT-style Khronos license)
+- SDL2 (zlib license) — not bundled; the device's own SDL2 is used.
+
+No original game assets or code are included. Animal Crossing is
+(c) Nintendo; this project is not affiliated with or endorsed by Nintendo.

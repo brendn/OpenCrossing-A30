@@ -10,6 +10,7 @@
 #   Roms/A30PORTS/ac-gc/AnimalCrossing
 #   Roms/A30PORTS/ac-gc/shaders/        (canonical copies from pc/shaders/)
 #   Roms/A30PORTS/ac-gc/rom/README.txt  (user supplies their own GAFE01 iso)
+#   Roms/A30PORTS/ac-gc/LICENSE.txt, licenses.txt
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +28,8 @@ PORT="$STAGE/Roms/A30PORTS/ac-gc"
 mkdir -p "$PORT/shaders" "$PORT/rom"
 cp "$REPO/pc/shaders/"* "$PORT/shaders/"
 cp "$HERE/rom-README.txt" "$PORT/rom/README.txt"
+cp "$REPO/LICENSE" "$PORT/LICENSE.txt"
+cp "$HERE/licenses.txt" "$PORT/licenses.txt"
 cp "$BIN" "$PORT/AnimalCrossing"
 chmod +x "$PORT/AnimalCrossing"
 cp "$HERE/Animal Crossing.sh" "$STAGE/Roms/A30PORTS/Animal Crossing.sh"
